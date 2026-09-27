@@ -483,6 +483,47 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(capacity["heart_rate_quality"]["runs"]), 1)
         self.assertIn("Capacity evidence index", (self.output / "evidence.md").read_text())
 
+    def test_stream_coverage_separates_response_samples_bins_hr_and_unavailable(self):
+        self.activities = [{"activityId": identifier, "activityType": {"typeKey": "running"},
+            "startTimeLocal": "2026-09-21 08:00:00", "distance": 200, "duration": 60}
+            for identifier in range(101, 107)]
+        self.add_call("get_activity_details", {"measurementCount": 0, "metricsCount": 0,
+            "metricDescriptors": [], "activityDetailMetrics": []}, [101])
+        self.add_call("get_activity_details", {
+            "metricDescriptors": [{"key": "directLatitude", "metricsIndex": 0}],
+            "activityDetailMetrics": [{"metrics": [41.123456789]}, {"metrics": [41.223456789]}],
+        }, [102])
+        self.add_call("get_activity_details", {
+            "metricDescriptors": [{"key": "directHeartRate", "metricsIndex": 0}],
+            "activityDetailMetrics": [{"metrics": [140]}, {"metrics": [145]}],
+        }, [103])
+        descriptors = [{"key": "sumDistance", "metricsIndex": 0},
+                       {"key": "directHeartRate", "metricsIndex": 1}]
+        self.add_call("get_activity_details", {"metricDescriptors": descriptors,
+            "activityDetailMetrics": [{"metrics": [0, None]}, {"metrics": [100, 0]}]}, [104])
+        self.add_call("get_activity_details", {"metricDescriptors": descriptors,
+            "activityDetailMetrics": [{"metrics": [0, 140]}, {"metrics": [100, 145]}]}, [105])
+        self.add_call("get_activity_details", None, [106], status="unavailable")
+
+        result = self.build()
+
+        coverage = result["coverage"]
+        self.assertEqual(coverage["running_count"], 6)
+        self.assertEqual(coverage["runs_with_streams"], 5)
+        self.assertEqual(coverage["runs_with_raw_stream_samples"], 4)
+        self.assertEqual(coverage["runs_with_usable_stream_samples"], 3)
+        self.assertEqual(coverage["runs_with_usable_stream_profiles"], 2)
+        self.assertEqual(coverage["runs_with_hr_stream_profiles"], 1)
+        self.assertEqual(coverage["runs_with_empty_stream_profiles"], 3)
+        self.assertEqual(coverage["call_status_counts"]["unavailable"], 1)
+        self.assertNotIn("stream", result["runs"][-1])
+        self.assertEqual(result["runs"][-1]["distance_m"], 200)
+        rendered = (self.output / "evidence.md").read_text()
+        self.assertIn("stream responses: 5", rendered)
+        self.assertIn("usable stream profiles: 2", rendered)
+        self.assertIn("responses without segments: 3", rendered)
+        self.assertNotIn("41.123456789", json.dumps(result))
+
 
 if __name__ == "__main__":
     unittest.main()

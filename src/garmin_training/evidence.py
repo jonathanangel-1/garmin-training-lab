@@ -843,6 +843,7 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
     activities.sort(key=lambda row: (row["date"] or "", row["activity_id"] or ""))
     daily.sort(key=lambda row: (row["date"] or "", row["kind"], row["source_id"]))
     runs = [activity for activity in activities if activity["is_running"]]
+    streams = [run["stream"] for run in runs if isinstance(run.get("stream"), dict)]
     coverage = {
         "snapshot_status": _token(manifest.get("status")), "boundaries": boundaries,
         "activities_source": {"raw_path": "activities.json", "sha256": hashlib.sha256((snapshot_dir / "activities.json").read_bytes()).hexdigest()},
@@ -860,6 +861,22 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
         "activities_with_summary_conflicts": sum(bool(row.get("summary_conflicts")) for row in activities),
         "summary_conflict_policy": "Compare supplied fields; omit rounded distance/pace derivatives. Ignore distance/elevation differences below 0.01 metre and duration differences below 0.01 second. Other supplied numeric fields use exact comparison.",
         "runs_with_streams": sum("stream" in row for row in runs),
+        "runs_with_raw_stream_samples": sum(stream.get("raw_sample_count", 0) > 0 for stream in streams),
+        "runs_with_usable_stream_samples": sum(stream.get("usable_sample_count", 0) > 0 for stream in streams),
+        "runs_with_usable_stream_profiles": sum(bool(stream.get("segments")) for stream in streams),
+        "runs_with_hr_stream_profiles": sum(
+            any(segment.get("hr_bpm_sample_count", 0) > 0 for segment in stream.get("segments", []))
+            for stream in streams
+        ),
+        "runs_with_empty_stream_profiles": sum(not stream.get("segments") for stream in streams),
+        "stream_coverage_semantics": {
+            "runs_with_streams": "Compatibility field: returned stream response objects, including empty profiles; not evidence of usable samples.",
+            "raw_samples": "Returned sample rows; these can contain only unrecognized or excluded channels.",
+            "usable_samples": "Rows with at least one recognized finite metric; they may lack the distance/time needed for binning.",
+            "usable_profiles": "Nonempty binned profiles; availability alone does not establish enough data for a valid pace/HR comparison.",
+            "hr_profiles": "Binned profiles with at least one positive HR sample; not duration coverage or proof of sensor accuracy.",
+            "empty_profiles": "Returned profiles without segments, including empty, unrecognized and unbinnable samples. Failed/unavailable endpoints are separate source statuses.",
+        },
         "runs_with_laps": sum("laps" in row for row in runs),
         "daily_dates_by_kind": {kind: sorted({row["date"] for row in daily if row["kind"] == kind and row["date"]}) for kind in sorted({row["kind"] for row in daily})},
         "daily_records_without_date": sum(row["date"] is None for row in daily),
@@ -902,7 +919,7 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
 def _markdown(bundle: dict) -> str:
     coverage = bundle["coverage"]
     lines = ["# Garmin training evidence", "", "This is an offline evidence bundle, not a coaching verdict.", "",
-             f"Activities: {coverage['activity_count']}; runs: {coverage['running_count']}; runs with stream profiles: {coverage['runs_with_streams']}.",
+             f"Activities: {coverage['activity_count']}; runs: {coverage['running_count']}; stream responses: {coverage['runs_with_streams']}; usable stream profiles: {coverage['runs_with_usable_stream_profiles']}; responses without segments: {coverage['runs_with_empty_stream_profiles']}.",
              f"Call coverage: {json.dumps(coverage['call_status_counts'], sort_keys=True)}. Normalization errors: {coverage['normalization_error_count']}.",
              "", "## Observed weekly running", "", "| Week starting | Runs | Days | Recorded km | Longest km | Missing distances | Partial week |", "|---|---:|---:|---:|---:|---:|---|"]
     for week in bundle["weeks"]:
