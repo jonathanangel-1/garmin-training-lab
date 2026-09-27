@@ -22,16 +22,19 @@ from .protocol import (
     AUDIT_PROMPT,
     CAPACITY_PROMPT,
     CAPACITY_SCHEMA,
+    COACHING_QUALITY_CRITERIA,
     FINAL_AUDIT_SCHEMA,
     FINAL_SCHEMA,
     METHOD,
-    PLAN_PROMPT,
+    PLAN_CANDIDATE_PROMPTS,
+    PLAN_SELECTION_PROMPT,
     PROTOCOL_VERSION,
     REVIEW_SCHEMA,
     REVISION_PROMPT,
     ROLES,
     SPECIALIST_SCHEMA,
 )
+from .research import RESEARCH_CONTEXT
 
 
 def _now():
@@ -104,6 +107,9 @@ def invoke_codex(prompt: str, schema: dict, output: Path, workspace: Path,
 
 def validate_final(result: dict, goal: dict, cutoff: date) -> None:
     jsonschema.validate(result, FINAL_SCHEMA)
+    option_ids = [option["option_id"] for option in result["planning_comparison"]["options_considered"]]
+    if len(option_ids) != len(set(option_ids)):
+        raise ValueError("Planning comparison option IDs must be unique")
     def finite(value):
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError("Non-finite numerical claim")
@@ -216,6 +222,19 @@ def seen_weeks_as_text(weeks):
     return {week.isoformat() for week in weeks}
 
 
+def coaching_audit_errors(audit: dict) -> list[str]:
+    """Require explicit review of coaching usefulness, not only factual defensibility."""
+    errors = []
+    for area in COACHING_QUALITY_CRITERIA:
+        checks = [check for check in audit["checks"] if check["area"] == area]
+        if len(checks) != 1 or checks[0]["result"] != "pass":
+            errors.append(
+                f"Workflow check: audit must explicitly pass {area} exactly once, "
+                "with evidence-based reasoning; revise the proposal if that criterion is unmet."
+            )
+    return errors
+
+
 def _clock(seconds):
     if seconds is None:
         return "unavailable"
@@ -253,6 +272,7 @@ def render_report(result: dict) -> str:
     for title, key in [("Capacity before considering the goal", "capacity_summary"),
                        ("Goal feasibility", "goal_feasibility"),
                        ("Provisional race strategy", "race_strategy"),
+                       ("Why this approach was selected", "planning_comparison"),
                        ("Why this training", "training_rationale"),
                        ("What would change the assessment", "assessment_actions")]:
         lines += [f"## {title}", ""] + _render_value(result[key]) + [""]
@@ -304,7 +324,9 @@ def run_analysis(evidence_path: Path, goal: dict, run_dir: Path,
                        "interpretation": "Athlete testimony, not independent device validation. Unknown symptoms are not an injury finding."}
     semantic_evidence = {key: value for key, value in evidence.items() if key != "generated_at"}
     protocol_path = Path(__file__).with_name("protocol.py")
-    protocol_material = [PROTOCOL_VERSION, METHOD, ROLES, CAPACITY_PROMPT, PLAN_PROMPT,
+    protocol_material = [PROTOCOL_VERSION, METHOD, ROLES, CAPACITY_PROMPT,
+                         PLAN_CANDIDATE_PROMPTS, PLAN_SELECTION_PROMPT, RESEARCH_CONTEXT,
+                         COACHING_QUALITY_CRITERIA,
                          AUDIT_PROMPT, REVISION_PROMPT, SPECIALIST_SCHEMA, REVIEW_SCHEMA,
                          CAPACITY_SCHEMA, FINAL_SCHEMA, FINAL_AUDIT_SCHEMA]
     fingerprint = hashlib.sha256((json.dumps(semantic_evidence, sort_keys=True)
@@ -317,6 +339,7 @@ def run_analysis(evidence_path: Path, goal: dict, run_dir: Path,
         raise ValueError("Run inputs changed; choose a new run directory")
     write_json(capacity_workspace / "evidence.json", evidence)
     write_json(capacity_workspace / "athlete_context.json", athlete_context)
+    write_json(capacity_workspace / "research_context.json", RESEARCH_CONTEXT)
     write_text(capacity_workspace / "evidence.md", markdown_text)
     # Prevent prior aggregate answers appearing in the first stage on resume.
     for filename in ("independent.json", "roundtable.json", "capacity.json", "goal.json"):
@@ -404,15 +427,49 @@ def run_analysis(evidence_path: Path, goal: dict, run_dir: Path,
         write_json(root / "capacity.json", capacity)
         # Only now introduce aspirations and constraints to a separate planning workspace.
         planning = ensure_private_dir(root / "inputs" / "planning")
-        for name in ("evidence.json", "athlete_context.json", "independent.json", "roundtable.json"):
+        shared_names = ("evidence.json", "athlete_context.json", "research_context.json",
+                        "independent.json", "roundtable.json")
+        for name in shared_names:
             write_json(planning / name, read_json(capacity_workspace / name))
         write_text(planning / "evidence.md", markdown_text)
         write_json(planning / "goal.json", goal)
         write_json(planning / "capacity.json", capacity)
-        for name in ("draft.json", "audit.json", "validation.json"):
+        for name in ("draft.json", "audit.json", "validation.json", "planning_candidates.json"):
             (planning / name).unlink(missing_ok=True)
-        _, draft = work("planning", "lead", METHOD + PLAN_PROMPT, FINAL_SCHEMA, planning,
-                        ("independent.json", "roundtable.json", "capacity.json"))
+        # Separate inputs prevent candidates from being shown one another's proposals.
+        # This is evidence separation, not an operating-system isolation boundary.
+        candidate_inputs = {}
+        for candidate_id in PLAN_CANDIDATE_PROMPTS:
+            folder = ensure_private_dir(root / "inputs" / "candidates" / candidate_id)
+            for name in shared_names + ("goal.json", "capacity.json"):
+                write_json(folder / name, read_json(planning / name))
+            write_text(folder / "evidence.md", markdown_text)
+            for name in ("draft.json", "audit.json", "planning_candidates.json"):
+                (folder / name).unlink(missing_ok=True)
+            candidate_inputs[candidate_id] = folder
+        candidates = {}
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(
+                work, "planning_candidates", candidate_id, METHOD + candidate_prompt,
+                FINAL_SCHEMA, candidate_inputs[candidate_id],
+                ("independent.json", "roundtable.json", "capacity.json"),
+            ) for candidate_id, candidate_prompt in PLAN_CANDIDATE_PROMPTS.items()]
+            for future in as_completed(futures):
+                candidate_id, proposal = future.result()
+                errors = []
+                try:
+                    validate_final(proposal, goal, cutoff)
+                except (ValueError, jsonschema.ValidationError) as exc:
+                    errors.append(str(exc)[:4000])
+                candidates[candidate_id] = {
+                    "plan": proposal,
+                    "structural_validation": {"passed": not errors, "errors": errors},
+                }
+        write_json(root / "planning_candidates.json", candidates)
+        write_json(planning / "planning_candidates.json", candidates)
+        _, draft = work("planning", "lead", METHOD + PLAN_SELECTION_PROMPT, FINAL_SCHEMA, planning,
+                        ("independent.json", "roundtable.json", "capacity.json",
+                         "planning_candidates.json"))
         validation_instruction = (
             "\nRead validation.json. It contains deterministic checks of this exact draft. "
             "Every listed error must be corrected before publication, even if an earlier "
@@ -425,6 +482,9 @@ def run_analysis(evidence_path: Path, goal: dict, run_dir: Path,
             validation_errors = []
             try:
                 validate_final(draft, goal, cutoff)
+                compared = {option["option_id"] for option in draft["planning_comparison"]["options_considered"]}
+                if not set(PLAN_CANDIDATE_PROMPTS) <= compared:
+                    raise ValueError("Selected plan must compare both independently generated candidates")
             except (ValueError, jsonschema.ValidationError) as exc:
                 validation_errors.append(str(exc)[:4000])
             validation = {"passed": not validation_errors, "errors": validation_errors,
@@ -435,13 +495,20 @@ def run_analysis(evidence_path: Path, goal: dict, run_dir: Path,
             state["deterministic_validation_status"] = "fail" if validation_errors else "pass"
             _, audit = work("audit", f"reviewer-{attempt}", METHOD + AUDIT_PROMPT + validation_instruction
                             + "If errors are present, do not return a passing verdict; identify the required corrections.",
-                            FINAL_AUDIT_SCHEMA, planning, ("capacity.json", "draft.json", "validation.json"))
+                            FINAL_AUDIT_SCHEMA, planning, ("capacity.json", "draft.json", "validation.json",
+                                                         "planning_candidates.json"))
+            # Keep the provider response intact in audit/reviewer-N.json, while
+            # recording deterministic publication-gate failures in audit.json.
+            for error in coaching_audit_errors(audit):
+                if error not in audit["required_changes"]:
+                    audit["required_changes"].append(error)
             write_json(root / "audit.json", audit)
-            state["audit_status"] = audit["verdict"]
             passed = (audit["verdict"] == "pass" and not audit["blockers"]
                       and not audit["required_changes"]
                       and not any(check["result"] == "fail" for check in audit["checks"])
                       and not validation_errors)
+            state["provider_audit_verdict"] = audit["verdict"]
+            state["audit_status"] = "pass" if passed else "blocked" if audit["verdict"] == "blocked" else "revise"
             if passed:
                 validate_final(draft, goal, cutoff)
                 report = render_report(draft)
@@ -456,7 +523,8 @@ def run_analysis(evidence_path: Path, goal: dict, run_dir: Path,
             write_json(planning / "audit.json", audit)
             _, draft = work("revision", f"lead-{attempt + 1}", METHOD + REVISION_PROMPT + validation_instruction
                             + "Repair every deterministic error as well as the audit findings. Recompute all affected totals and deltas.",
-                            FINAL_SCHEMA, planning, ("capacity.json", "draft.json", "audit.json", "validation.json"))
+                            FINAL_SCHEMA, planning, ("capacity.json", "draft.json", "audit.json", "validation.json",
+                                                   "planning_candidates.json"))
         raise RuntimeError("Analysis ended without an audited proposal")
     except Exception:
         for name in ("final.json", "report.md"):

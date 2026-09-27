@@ -483,6 +483,26 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(capacity["heart_rate_quality"]["runs"]), 1)
         self.assertIn("Capacity evidence index", (self.output / "evidence.md").read_text())
 
+    def test_longitudinal_integration_requires_completed_sleep_and_preserves_provenance(self):
+        from datetime import datetime, timezone
+
+        def millis(value):
+            return int(datetime.fromisoformat(value).replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+        self.activities = [{"activityId": 101, "activityType": {"typeKey": "running"},
+            "startTimeLocal": "2026-09-02 08:00:00", "startTimeGMT": "2026-09-02 12:00:00", "distance": 10_000, "duration": 3300, "elapsedDuration": 3400}]
+        self.add_call("get_sleep_data", {"dailySleepDTO": {"calendarDate": "2026-09-02", "sleepTimeSeconds": 25_200,
+            "sleepStartTimestampGMT": millis("2026-09-02T01:00:00"), "sleepEndTimestampGMT": millis("2026-09-02T08:00:00")}}, ["2026-09-02"])
+        self.add_call("get_sleep_data", {"dailySleepDTO": {"calendarDate": "2026-09-03", "sleepTimeSeconds": None}}, ["2026-09-03"])
+        result = self.build()
+        longitudinal = result["longitudinal_metrics"]
+        self.assertEqual(longitudinal["coverage"]["aligned_run_count"], 1)
+        self.assertEqual(longitudinal["coverage"]["sleep"]["usable_completed_sleep_records"], 1)
+        self.assertEqual(longitudinal["coverage"]["sleep"]["rejected_or_qualified"]["missing_or_invalid_explicit_gmt_interval"], 1)
+        self.assertIn("call:00000", json.dumps(longitudinal["run_contexts"]))
+        self.assertNotIn("call:00001", json.dumps(longitudinal["run_contexts"]))
+        self.assertIn("Longitudinal evidence index", (self.output / "evidence.md").read_text())
+
     def test_stream_coverage_separates_response_samples_bins_hr_and_unavailable(self):
         self.activities = [{"activityId": identifier, "activityType": {"typeKey": "running"},
             "startTimeLocal": "2026-09-21 08:00:00", "distance": 200, "duration": 60}
@@ -523,6 +543,112 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("usable stream profiles: 2", rendered)
         self.assertIn("responses without segments: 3", rendered)
         self.assertNotIn("41.123456789", json.dumps(result))
+
+
+    def test_time_context_uses_event_offset_across_utc_midnight_and_dst(self):
+        self.activities = [
+            {"activityId": 101, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-01-02 23:30:00", "startTimeGMT": "2026-01-03 04:30:00", "locationName": "  "},
+            {"activityId": 102, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-09-02 23:30:00", "startTimeGMT": "2026-09-03 03:30:00"},
+            {"activityId": 103, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-09-03 07:00:00", "startTimeGMT": "2026-09-03 04:00:00"},
+        ]
+        for identifier in (101, 102, 103):
+            self.add_call("get_activity", {"timeZoneUnitDTO": {"unitKey": "America/New_York", "unitId": 998877}}, [identifier])
+        result = self.build()
+        first, second, third = result["runs"]
+        self.assertEqual(first["date"], "2026-01-02")
+        self.assertIsNone(first["location_name"])
+        self.assertEqual(first["time_context"]["observed_utc_offset_minutes"], -300)
+        self.assertEqual(second["time_context"]["observed_utc_offset_minutes"], -240)
+        self.assertEqual(first["time_context"]["timestamp_consistency"], "consistent_with_explicit_timezone")
+        self.assertEqual(third["time_context"]["timestamp_consistency"], "conflicts_with_explicit_timezone")
+        self.assertNotIn("country", first["time_context"])
+        self.assertNotIn("998877", json.dumps(result))
+
+    def test_anonymous_route_groups_match_full_corridors_and_keep_coordinates_private(self):
+        self.activities = [{"activityId": identifier, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-09-02 08:00:00"} for identifier in range(101, 106)]
+        route = [{"lat": 40.123456789 + index * .001, "lon": -73.123456789} for index in range(21)]
+        parallel = [{"lat": row["lat"], "lon": row["lon"] + .0005} for row in route]
+        different = [{"lat": route[0]["lat"], "lon": route[0]["lon"] + index * .001} for index in range(21)]
+        for identifier, points in ((101, route), (102, list(reversed(parallel))), (103, different), (104, route[:2])):
+            self.add_call("get_activity_details", {"geoPolylineDTO": {"polyline": points}}, [identifier])
+        self.add_call("get_activity_details", {"geoPolylineDTO": None, "metricDescriptors": None, "activityDetailMetrics": None}, [105])
+        result = self.build()
+        runs = result["runs"]
+        self.assertEqual(runs[0]["route_context"]["route_group_id"], runs[1]["route_context"]["route_group_id"])
+        self.assertEqual(runs[0]["route_context"]["matched_activity_ids"], ["102"])
+        self.assertEqual(runs[2]["route_context"]["status"], "no_matching_corridor")
+        self.assertEqual(runs[3]["route_context"]["status"], "insufficient_coordinates")
+        self.assertEqual(runs[4]["route_context"]["status"], "insufficient_coordinates")
+        self.assertEqual(result["coverage"]["route_context"]["runs_with_matched_corridors"], 2)
+        for private in ("40.123456789", "-73.123456789", "geoPolylineDTO", '"lat"', '"lon"'):
+            self.assertNotIn(private, json.dumps(result))
+
+    def test_route_groups_do_not_chain_nearby_but_incomparable_corridors(self):
+        self.activities = [{"activityId": identifier, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-09-02 08:00:00"} for identifier in range(101, 104)]
+        for identifier, shift in ((101, 0), (102, .0012), (103, .0024)):
+            points = [{"lat": 40 + index * .001, "lon": -73 + shift} for index in range(21)]
+            self.add_call("get_activity_details", {"geoPolylineDTO": {"polyline": points}}, [identifier])
+        result = self.build()
+        groups = [row["route_context"]["route_group_id"] for row in result["runs"]]
+        self.assertEqual(groups[0], groups[1])
+        self.assertIsNone(groups[2])
+
+    def test_route_descriptor_fallback_uses_named_coordinate_indexes(self):
+        self.activities = [{"activityId": identifier, "activityType": {"typeKey": "running"}} for identifier in (101, 102)]
+        descriptors = [{"key": "directLatitude", "metricsIndex": 3, "unit": {"key": "dd"}}, {"key": "directLongitude", "metricsIndex": 1, "unit": {"key": "dd"}}]
+        rows = [{"metrics": [140, -73.123456789, 5, 40.123456789 + index * .001]} for index in range(21)]
+        self.add_call("get_activity_details", {"metricDescriptors": descriptors, "activityDetailMetrics": rows}, [101])
+        self.add_call("get_activity_details", {"metricDescriptors": [{**descriptor, "metricsIndex": 3 - descriptor["metricsIndex"]} for descriptor in descriptors], "activityDetailMetrics": [{"metrics": list(reversed(row["metrics"]))} for row in rows]}, [102])
+        result = self.build()
+        self.assertEqual(result["runs"][0]["route_context"]["route_group_id"], result["runs"][1]["route_context"]["route_group_id"])
+        self.assertIsNotNone(result["runs"][0]["route_context"]["route_group_id"])
+        self.assertNotIn("40.123456789", json.dumps(result))
+        self.assertNotIn("-73.123456789", json.dumps(result))
+
+    def test_activity_hr_sensor_categories_survive_without_serial_identifiers(self):
+        self.activities = [{"activityId": 101, "activityType": {"typeKey": "running"}}]
+        self.add_call("get_activity", {"metadataDTO": {"sensors": [
+            {"manufacturer": "POLAR_ELECTRO", "sourceType": "ANTPLUS", "antplusDeviceType": "HEART_RATE", "serialNumber": "PRIVATE_SERIAL", "displayName": "PRIVATE_SENSOR_NAME"},
+            {"sourceType": "ANTPLUS", "antplusDeviceType": "RUN"},
+        ]}}, [101])
+        result = self.build()
+        values = [row["values"] for row in result["runs"][0]["sensor_metadata"]]
+        self.assertTrue(any(row.get("antplusDeviceType") == "HEART_RATE" and row.get("sourceType") == "ANTPLUS" for row in values))
+        self.assertEqual(result["coverage"]["runs_with_explicit_hr_sensor_metadata"], 1)
+        self.assertNotIn("PRIVATE_", json.dumps(result))
+
+    def test_weather_keeps_observation_timing_without_guessing_units_from_values(self):
+        self.activities = [{"activityId": 101, "activityType": {"typeKey": "running"}, "startTimeLocal": "2026-09-02 06:30:00", "startTimeGMT": "2026-09-02 10:30:00"}]
+        self.add_call("get_activity_weather", {"issueDate": "2026-09-02T10:51:00+00:00", "temp": 63, "windSpeed": 13, "latitude": 40.123456789, "weatherStationDTO": {"id": "PRIVATE_STATION"}}, [101])
+        weather = self.build()["runs"][0]["weather"]
+        self.assertEqual(weather["values"]["temp"], 63)
+        self.assertEqual(weather["observation_offset_from_run_start_minutes"], 21)
+        self.assertTrue(weather["unit_verification"].startswith("unverified:"))
+        self.assertNotIn("temperature_c", weather)
+        self.assertNotIn("PRIVATE_STATION", json.dumps(weather))
+        self.assertNotIn("40.123456789", json.dumps(weather))
+
+    def test_sleep_coverage_counts_usable_dates_across_range_and_fallback(self):
+        self.add_call("get_sleep_daily", [
+            {"calendarDate": "2026-09-01", "values": {"totalSleepTimeInSeconds": 28_800}},
+            {"calendarDate": "2026-09-02", "values": {"totalSleepTimeInSeconds": None}},
+            {"calendarDate": "2026-09-03", "values": {"totalSleepTimeInSeconds": 0}},
+        ], ["2026-09-01", "2026-09-27"])
+        self.add_call("get_sleep_data", {"dailySleepDTO": {"calendarDate": "2026-09-02", "sleepTimeSeconds": 25_200, "sleepEndTimestampGMT": 1788325200000}}, ["2026-09-02"])
+        self.add_call("get_sleep_data", None, ["2026-09-04"], status="empty")
+        self.add_call("get_sleep_data", {"dailySleepDTO": {"calendarDate": "2026-09-03", "sleepTimeSeconds": None, "sleepEndTimestampGMT": None}}, ["2026-09-03"])
+        result = self.build()
+        coverage = result["coverage"]["sleep"]
+        self.assertEqual(coverage["expected_date_count"], 27)
+        self.assertEqual(coverage["dates_with_records_count"], 3)
+        self.assertEqual(coverage["dates_with_positive_total_sleep_count"], 2)
+        self.assertEqual(coverage["record_dates_without_positive_total_sleep"], ["2026-09-03"])
+        self.assertEqual(len(coverage["missing_usable_dates"]), 25)
+        self.assertNotIn("2026-09-02", coverage["missing_usable_dates"])
+        self.assertEqual(coverage["fallback_call_status_counts"], {"ok": 2, "empty": 1})
+        self.assertEqual(result["resources"][-1]["normalization"], "curated_daily_no_positive_sleep")
+        self.assertEqual(result["resources"][-1]["positive_total_sleep_record_count"], 0)
+        self.assertEqual(result["daily_units"]["sleep"]["sleepEndTimestampGMT"], "UTC timestamp milliseconds")
 
 
 if __name__ == "__main__":

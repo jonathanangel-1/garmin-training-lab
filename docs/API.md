@@ -100,7 +100,7 @@ print(analysis_job)
 
 Replace the fictional example goal before use. This request uses the goal in its body, not the CLI's saved `goal.json`.
 
-The API uses the runner's defaults: concurrency 3 and Codex's default model. Use the CLI for a different concurrency or explicit model. A full new run makes 21–25 calls: nine goal-blind specialists, nine cross-reviews, capacity synthesis, planning and independent audit, with up to two revision/audit cycles. Only an audit with a pass verdict and no blockers, required changes or failed checks allows a final result.
+The API uses the runner's defaults: concurrency 3 and Codex's default model. Use the CLI for a different concurrency or explicit model. A full new run makes 23–27 calls: nine goal-blind specialists, nine cross-reviews, capacity synthesis, two independent candidate plans, selection and independent audit, with up to two revision/audit cycles. Only an audit with a pass verdict, no blockers/required changes/failed checks, and an explicit pass for each of eight coaching-quality criteria allows a final result. Candidates alone are never served as the final plan.
 
 ### Goal object
 

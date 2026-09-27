@@ -26,6 +26,8 @@ ACTIVITY_PAGE_SIZE = 100
 DETAIL_CHART_LIMIT = 20_000
 DETAIL_POLYLINE_LIMIT = 20_000
 MAX_DEVICE_SETTINGS = 3
+MAX_SLEEP_FALLBACK_DAYS = 60
+FALLBACK_METHODS = ("get_sleep_data",)
 
 RANGE_METHODS = (
     "get_daily_steps",
@@ -104,6 +106,28 @@ def _windows(start: date, end: date):
         last = min(current + timedelta(days=27), end)
         yield current, last
         current = last + timedelta(days=1)
+
+
+def _sleep_dates(payload: Any, method: str, requested: str | None = None) -> set[str]:
+    """Dates with positive recorded sleep, not just returned date placeholders."""
+    if method == "get_sleep_data":
+        rows = [payload.get("dailySleepDTO")] if isinstance(payload, dict) else []
+    else:
+        rows = payload.get("individualStats", []) if isinstance(payload, dict) else payload
+    result = set()
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        values = row.get("values") if isinstance(row.get("values"), dict) else row
+        total = next((values.get(key) for key in ("totalSleepTimeInSeconds", "sleepTimeSeconds", "totalSleepSeconds") if values.get(key) is not None), None)
+        if isinstance(total, bool) or not isinstance(total, (int, float)) or not math.isfinite(total) or total <= 0:
+            continue
+        value = row.get("calendarDate") or row.get("date") or requested
+        try:
+            result.add(date.fromisoformat(value).isoformat())
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def _local_date(activity: dict[str, Any]) -> date | None:
@@ -363,11 +387,14 @@ def collect_snapshot(
     manifest["selected_activity_ids"] = [item.get("activityId") for item in selected]
     manifest["detail_selection_truncated"] = len(runs) > max_details
     state.checkpoint()
+    range_sleep_dates: set[str] = set()
     for first, last in _windows(start, end):
         if state.interrupted:
             break
         for method in RANGE_METHODS:
-            state.call(method, first.isoformat(), last.isoformat())
+            success, payload = state.call(method, first.isoformat(), last.isoformat())
+            if method == "get_sleep_daily" and success:
+                range_sleep_dates.update(_sleep_dates(payload, method))
             if state.interrupted:
                 break
     for activity in selected:
@@ -428,6 +455,34 @@ def collect_snapshot(
         if state.interrupted:
             break
         state.call("get_device_settings", identifier)
+    # The range endpoint can omit nights even within its documented 28-day
+    # window. Probe only gaps, after prior resources to preserve cache ordering.
+    expected_dates = {(start + timedelta(days=index)).isoformat() for index in range((end - start).days + 1)}
+    missing_sleep_dates = sorted(expected_dates - range_sleep_dates, reverse=True)
+    selected_sleep_dates = missing_sleep_dates[:MAX_SLEEP_FALLBACK_DAYS]
+    recovered_sleep_dates: set[str] = set()
+    fallback = {
+        "method": "get_sleep_data", "maximum_days": MAX_SLEEP_FALLBACK_DAYS,
+        "selection": "newest dates without positive total sleep in range response",
+        "expected_date_count": len(expected_dates),
+        "range_usable_date_count": len(expected_dates & range_sleep_dates),
+        "missing_dates_before_fallback": sorted(missing_sleep_dates),
+        "selected_dates": selected_sleep_dates,
+        "truncated": len(missing_sleep_dates) > MAX_SLEEP_FALLBACK_DAYS,
+        "recovered_dates": [],
+        "note": "No record is not zero sleep. Cached empty responses remain observed empty; use a fresh snapshot for refreshed readings.",
+    }
+    manifest["sleep_fallback_policy"] = fallback
+    if fallback["truncated"]:
+        state.problem("sleep_fallback_limit_reached", count=len(missing_sleep_dates), selected=len(selected_sleep_dates))
+    for sleep_date in selected_sleep_dates:
+        if state.interrupted:
+            break
+        success, payload = state.call("get_sleep_data", sleep_date)
+        if success and sleep_date in _sleep_dates(payload, "get_sleep_data", sleep_date):
+            recovered_sleep_dates.add(sleep_date)
+        fallback["recovered_dates"] = sorted(recovered_sleep_dates)
+    fallback["missing_dates_after_fallback"] = sorted(expected_dates - range_sleep_dates - recovered_sleep_dates)
     manifest["status"] = "interrupted" if state.interrupted else "partial" if manifest["errors"] or manifest["completeness"] else "complete"
     manifest["finished_at"] = _now()
     state.checkpoint()

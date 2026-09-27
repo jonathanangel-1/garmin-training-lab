@@ -142,14 +142,50 @@ def example_final():
             "load_cost": "No exercise load", "counts_as_stressor": False,
             "replaces_planned_session": None, "evidence": ["synthetic-device-settings"],
         }],
+        "planning_comparison": {
+            "primary_performance_gap": "Longer-duration repeatability",
+            "selected_approach": "development: extend duration while preserving frequency",
+            "options_considered": [
+                {
+                    "option_id": "development", "approach": "Emphasize continuous duration",
+                    "meaningful_difference": "More load in one existing long outing",
+                    "expected_benefit": "Additional sustained duration and intake practice",
+                    "fatigue_cost": "Greater concentration in a single outing",
+                    "evidence_and_assumptions": ["Synthetic recent duration is repeatable"],
+                    "selection_reason": "Directly addresses the synthetic duration gap",
+                    "confidence": "moderate",
+                },
+                {
+                    "option_id": "alternative", "approach": "Distribute comparable time",
+                    "meaningful_difference": "Less concentration, more time in ordinary runs",
+                    "expected_benefit": "Distributed aerobic exposure",
+                    "fatigue_cost": "More work on surrounding days",
+                    "evidence_and_assumptions": ["Synthetic ordinary runs were tolerated"],
+                    "selection_reason": "Less specific to sustained duration in this fixture",
+                    "confidence": "moderate",
+                },
+            ],
+            "selection_reason": "The primary gap favors sustained exposure in this fixture",
+            "remaining_tradeoff": "Concentrated duration requires explicit follow-up",
+            "decision_rules": [{
+                "completed_session_or_block": "Synthetic first long outing",
+                "criteria_to_progress": "Controlled finish and ordinary function restored",
+                "progression_action": "Proceed with the next listed duration session",
+                "criteria_to_hold_or_reduce": "Persistent fatigue alters subsequent easy running",
+                "hold_or_reduce_action": "Replace the next steady component with easy running",
+                "working_race_effort_update": "Retain provisional effort; duration alone does not validate race pace",
+                "evidence": ["synthetic-long-runs"],
+            }],
+        },
     }
 
 
 def example_audit(verdict="pass"):
     result = {
         "verdict": verdict, "summary": "Synthetic audit", "confidence": "high",
-        "checks": [{"area": "arithmetic", "result": "pass", "reason": "Recomputed",
-                    "evidence": ["synthetic-week-1-to-4"]}],
+        "checks": [{"area": key, "result": "pass", "reason": "Synthetic criterion handled",
+                    "evidence": ["synthetic-week-1-to-4"]}
+                   for key in p.COACHING_QUALITY_CRITERIA],
         "blockers": [], "required_changes": [],
     }
     if verdict != "pass":
@@ -235,7 +271,8 @@ def test_full_proposal_accepts_unquantified_race_and_source_bounded_forecast():
 
 
 @pytest.mark.parametrize("missing", ["capacity_summary", "goal_feasibility", "race_strategy",
-                                     "training_rationale", "assessment_actions"])
+                                     "training_rationale", "assessment_actions",
+                                     "planning_comparison"])
 def test_legacy_goal_led_output_cannot_skip_capability_and_load_assessment(missing):
     result = example_final()
     del result[missing]
@@ -291,3 +328,64 @@ def test_audit_blocker_requires_reason_source_and_correction(missing):
     del result["blockers"][0][missing]
     with pytest.raises(jsonschema.ValidationError, match="required property"):
         jsonschema.validate(result, p.FINAL_AUDIT_SCHEMA)
+
+
+@pytest.mark.parametrize("option_count", [0, 1])
+def test_plan_must_compare_more_than_its_selected_option(option_count):
+    result = example_final()
+    result["planning_comparison"]["options_considered"] = (
+        result["planning_comparison"]["options_considered"][:option_count]
+    )
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(result, p.FINAL_SCHEMA)
+
+
+@pytest.mark.parametrize("missing", ["meaningful_difference", "expected_benefit",
+                                     "fatigue_cost", "evidence_and_assumptions",
+                                     "selection_reason", "confidence"])
+def test_nearby_option_requires_comparative_tradeoff_not_only_a_name(missing):
+    result = example_final()
+    del result["planning_comparison"]["options_considered"][1][missing]
+    with pytest.raises(jsonschema.ValidationError, match="required property"):
+        jsonschema.validate(result, p.FINAL_SCHEMA)
+
+
+def test_comparison_rejects_empty_rationale_and_unstated_assumptions():
+    result = example_final()
+    result["planning_comparison"]["selection_reason"] = ""
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(result, p.FINAL_SCHEMA)
+    result = example_final()
+    result["planning_comparison"]["options_considered"][0]["evidence_and_assumptions"] = []
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(result, p.FINAL_SCHEMA)
+
+
+def test_plan_requires_a_decision_path_after_observation():
+    result = example_final()
+    result["planning_comparison"]["decision_rules"] = []
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(result, p.FINAL_SCHEMA)
+
+
+@pytest.mark.parametrize("missing", ["completed_session_or_block", "criteria_to_progress",
+                                     "progression_action", "criteria_to_hold_or_reduce",
+                                     "hold_or_reduce_action", "working_race_effort_update"])
+def test_decision_rule_requires_both_training_actions_and_race_effort_interpretation(missing):
+    result = example_final()
+    del result["planning_comparison"]["decision_rules"][0][missing]
+    with pytest.raises(jsonschema.ValidationError, match="required property"):
+        jsonschema.validate(result, p.FINAL_SCHEMA)
+
+
+def test_explicit_inferred_hr_guidance_does_not_require_claiming_measured_calibration():
+    result = example_final()
+    result["capacity_summary"]["hr_calibration_status"] = "device_estimated"
+    strategy = result["race_strategy"]
+    strategy["hr_basis"] = "inferred"
+    strategy["hr_guidance"] = {
+        "low_bpm": 145, "high_bpm": 150, "description": "Synthetic provisional opening guidance",
+        "basis": "coaching_judgment", "evidence": ["synthetic-comparable-efforts"],
+        "limitations": ["Not a measured threshold or proof of marathon sustainability"],
+    }
+    jsonschema.validate(result, p.FINAL_SCHEMA)

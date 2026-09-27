@@ -18,8 +18,10 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .capacity_metrics import build_capacity_metrics
+from .longitudinal import build_longitudinal_metrics
 
 SCHEMA_VERSION = 1
 MAX_SEGMENTS = 256
@@ -143,10 +145,136 @@ def _normalize_activity(data: dict) -> dict:
         "start_local": start_local,
         "start_gmt": start_gmt,
         "time_zone_id": timezone_value if isinstance(timezone_value, (int, float)) else _token(timezone_value),
-        "location_name": data.get("locationName") if isinstance(data.get("locationName"), str) else None,
+        "location_name": data.get("locationName").strip() or None if isinstance(data.get("locationName"), str) else None,
         **_metrics(data),
     }
     return result
+
+
+def _time_context(data: dict, source_id: str) -> dict:
+    """Keep source clocks and a date-specific offset; a timezone is not country."""
+    dto = data.get("timeZoneUnitDTO")
+    zone_name = _token(dto.get("unitKey") or dto.get("timeZone")) if isinstance(dto, dict) else None
+    zone = None
+    if zone_name:
+        try:
+            zone = ZoneInfo(zone_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            zone_name = None
+    local, gmt = _timestamp(data.get("startTimeLocal")), _timestamp(data.get("startTimeGMT"))
+    offset, expected = None, None
+    consistency = "timezone_only" if zone else "unavailable"
+    if local and gmt:
+        local_clock = datetime.fromisoformat(local.replace("Z", "+00:00"))
+        utc_clock = datetime.fromisoformat(gmt.replace("Z", "+00:00"))
+        utc_clock = utc_clock.replace(tzinfo=timezone.utc) if utc_clock.tzinfo is None else utc_clock.astimezone(timezone.utc)
+        difference = (local_clock.replace(tzinfo=None) - utc_clock.replace(tzinfo=None)).total_seconds() / 60
+        if -720 <= difference <= 840 and difference % 15 == 0:
+            offset = int(difference)
+            consistency = "paired_timestamps_only"
+            if zone:
+                expected = int(utc_clock.astimezone(zone).utcoffset().total_seconds() / 60)
+                consistency = "consistent_with_explicit_timezone" if offset == expected else "conflicts_with_explicit_timezone"
+        else:
+            consistency = "invalid_observed_offset"
+    return {"iana_timezone": zone_name, "observed_utc_offset_minutes": offset,
+            "zone_utc_offset_minutes_at_start": expected, "timestamp_consistency": consistency,
+            "source_id": source_id,
+            "interpretation": "Recorded activity clocks and explicit Garmin timezone only. Neither establishes country or location; local activity date is retained across UTC midnight and DST. Prefer UTC sleep endpoints for joins; Garmin warns some local sleep timestamps can be offset twice."}
+
+
+def _distance_between(left: tuple, right: tuple) -> float:
+    lat1, lon1, lat2, lon2 = map(math.radians, (*left, *right))
+    hav = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+    return 6_371_000 * 2 * math.asin(min(1, math.sqrt(hav)))
+
+
+def _private_route_points(details: Any) -> list[tuple]:
+    """Temporary local-only coordinates; never serialize this return value."""
+    if not isinstance(details, dict):
+        return []
+    polyline = details.get("geoPolylineDTO")
+    rows = polyline.get("polyline") if isinstance(polyline, dict) else None
+    candidates = []
+    if isinstance(rows, list):
+        candidates = [(row.get("lat"), row.get("lon")) for row in rows if isinstance(row, dict) and row.get("valid") is not False]
+    if not candidates:
+        indexes = {row.get("key"): row.get("metricsIndex") for row in details.get("metricDescriptors") or [] if isinstance(row, dict)}
+        lat, lon = indexes.get("directLatitude"), indexes.get("directLongitude")
+        if all(isinstance(index, int) and not isinstance(index, bool) and index >= 0 for index in (lat, lon)):
+            for row in details.get("activityDetailMetrics") or []:
+                values = row.get("metrics") if isinstance(row, dict) else None
+                if isinstance(values, list) and max(lat, lon) < len(values):
+                    candidates.append((values[lat], values[lon]))
+    points, seen = [], set()
+    for latitude, longitude in candidates:
+        if _num(latitude) is None or _num(longitude) is None or not -85 <= latitude <= 85 or not -180 <= longitude <= 180:
+            continue
+        point = (float(latitude), float(longitude))
+        cell = (round(latitude, 4), round(longitude, 4))
+        if cell in seen or points and _distance_between(points[-1], point) < 40:
+            continue
+        seen.add(cell)
+        points.append(point)
+    if len(points) > 512:
+        points = [points[round(index * (len(points) - 1) / 511)] for index in range(512)]
+    if len(points) < 12 or max((_distance_between(points[0], point) for point in points), default=0) < 500:
+        return []
+    return points
+
+
+def _route_contexts(runs: list[dict], private_routes: dict) -> dict:
+    """Anonymous bilateral corridor matches, not route/location disclosure."""
+    indexes, comparisons = {}, {}
+    for identifier, (_, points) in private_routes.items():
+        grid = defaultdict(list)
+        for point in points:
+            grid[(math.floor(point[0] / .002), math.floor(point[1] / .02))].append(point)
+        indexes[identifier] = grid
+
+    def overlap(first, second):
+        key = tuple(sorted((first, second)))
+        if key not in comparisons:
+            fractions = []
+            for left, right in ((first, second), (second, first)):
+                points = private_routes[left][1]
+                matched = 0
+                for point in points:
+                    lat, lon = math.floor(point[0] / .002), math.floor(point[1] / .02)
+                    nearby = (other for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                              for other in indexes[right].get((lat + dx, lon + dy), []))
+                    matched += any(_distance_between(point, other) <= 150 for other in nearby)
+                fractions.append(matched / len(points))
+                if fractions[-1] < .85:
+                    break
+            comparisons[key] = min(fractions) >= .85
+        return comparisons[key]
+
+    groups = []
+    for run in runs:
+        identifier = run["activity_id"]
+        if identifier not in private_routes or not private_routes[identifier][1]:
+            continue
+        group = next((group for group in groups if all(overlap(identifier, other) for other in group)), None)
+        if group is None:
+            groups.append([identifier])
+        else:
+            group.append(identifier)
+    memberships = {identifier: (f"route-{index:03d}", group) for index, group in enumerate(groups, 1) if len(group) > 1 for identifier in group}
+    for run in runs:
+        source_id, points = private_routes.get(run["activity_id"], (None, []))
+        group_id, group = memberships.get(run["activity_id"], (None, []))
+        matches = [identifier for identifier in group if identifier != run["activity_id"]]
+        run["route_context"] = {
+            "route_group_id": group_id, "status": "matched_corridor" if group_id else "no_matching_corridor" if points else "insufficient_coordinates",
+            "source_id": source_id, "comparison_point_count": len(points),
+            "matched_activity_ids": matches[:30], "matched_activity_count": len(matches),
+            "method": "Both routes have >=85% of at most512 distance-spaced points within150m of the other; every pair in a group must pass. Minimum12 points and500m extent. Group IDs are anonymous and local to this bundle.",
+            "comparison_note": "Shared route corridor only; direction, repeated laps, segment alignment, total distance, terrain and weather are not established equal. No GPS coordinates or coordinate hashes leave local normalization. Missing coordinates do not establish indoor activity.",
+        }
+    return {"matched_group_count": len({group_id for group_id, _ in memberships.values()}),
+            "runs_with_comparable_route_points": sum(bool(points) for _, points in private_routes.values()),
+            "runs_with_matched_corridors": len(memberships)}
 
 
 # Descriptor units are interpreted only when recognized. Absent units retain the
@@ -377,6 +505,7 @@ DEVICE_METADATA = {
     "softwareVersion": "token", "firmwareVersion": "token", "sensorType": "token",
     "connectionType": "token", "isPrimaryTrainingDevice": "bool", "isPrimaryWearable": "bool",
     "heartRateSource": "token", "hrSource": "token",
+    "sourceType": "token", "antplusDeviceType": "token",
 }
 CALIBRATION_CONTAINERS = {
     "data", "values", "daily", "dailyStats", "metrics", "stats", "entries",
@@ -519,6 +648,10 @@ def _daily_units(kind: str) -> dict:
             "localSleepEndTimeInMillis": "local timestamp milliseconds; not UTC",
             "gmtSleepStartTimeInMillis": "UTC timestamp milliseconds",
             "gmtSleepEndTimeInMillis": "UTC timestamp milliseconds",
+            "sleepStartTimestampGMT": "UTC timestamp milliseconds",
+            "sleepEndTimestampGMT": "UTC timestamp milliseconds",
+            "sleepStartTimestampLocal": "local timestamp milliseconds; Garmin documents possible double timezone offsets, prefer GMT endpoints",
+            "sleepEndTimestampLocal": "local timestamp milliseconds; Garmin documents possible double timezone offsets, prefer GMT endpoints",
             "restingHeartRate": "bpm", "avgHeartRate": "bpm", "avgOvernightHrv": "milliseconds",
             "hrv7dAverage": "milliseconds", "respiration": "breaths/min", "spO2": "percent",
             "skinTempC": "Garmin source Celsius field; absolute-versus-change semantics not assumed",
@@ -614,6 +747,25 @@ def _weeks(runs: list[dict], boundaries: dict) -> list[dict]:
             "partial_boundary_week": bool(start and week < start or end and (date.fromisoformat(week) + timedelta(days=6)).isoformat() > end),
         })
     return rows
+
+
+def _sleep_coverage(daily: list[dict], boundaries: dict, sources: list[dict]) -> dict:
+    start, end = boundaries.get("start"), boundaries.get("end")
+    expected = set()
+    if start and end:
+        first, last = date.fromisoformat(start), date.fromisoformat(end)
+        expected = {(first + timedelta(days=index)).isoformat() for index in range((last - first).days + 1)}
+    rows = [row for row in daily if row["kind"] == "sleep" and row["date"] in expected]
+    present = {row["date"] for row in rows}
+    usable = {row["date"] for row in rows if any((_num(row["values"].get(field)) or 0) > 0 for field in ("totalSleepTimeInSeconds", "sleepTimeSeconds", "totalSleepSeconds"))}
+    fallback = [source for source in sources if source["method"] == "get_sleep_data"]
+    return {"expected_date_count": len(expected), "dates_with_records_count": len(present),
+            "dates_with_positive_total_sleep_count": len(usable),
+            "missing_usable_dates": sorted(expected - usable),
+            "record_dates_without_positive_total_sleep": sorted(present - usable),
+            "fallback_call_status_counts": dict(Counter(source["status"] for source in fallback)),
+            "fallback_requested_dates": sorted({source["requested_date"] for source in fallback if source["requested_date"]}),
+            "interpretation": "Distinct local calendar dates with a positive recorded total, independent of endpoint response count. Absent/zero/null totals are not proof of no sleep, vacation, or nonwear. GMT sleep end fields are required for reliable preceding-run joins across travel."}
 
 
 def _metric_date_counts(daily: list[dict]) -> dict:
@@ -767,8 +919,14 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
                                       "kind": kind, "source_id": source["source_id"], "values": record})
                     resource["normalization"] = "curated_daily"
                     resource["record_count"] = len(records)
+                    if kind == "sleep":
+                        usable_sleep_records = sum(any((_num(record.get(field)) or 0) > 0 for field in ("totalSleepTimeInSeconds", "sleepTimeSeconds", "totalSleepSeconds")) for record in records)
+                        resource["positive_total_sleep_record_count"] = usable_sleep_records
+                        if not usable_sleep_records:
+                            resource["normalization"] = "curated_daily_no_positive_sleep"
         resources.append(resource)
     activities, duplicate_ids, seen = [], [], set()
+    private_routes = {}
     for summary in activity_data:
         if not isinstance(summary, dict):
             continue
@@ -797,6 +955,7 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
                         combined[key] = value
                 resource["normalization"] = "activity_summary"
         activity = _normalize_activity(combined)
+        activity["time_context"] = _time_context(combined, next((source["source_id"] for method, _, source, _ in related if method == "get_activity"), "activities.json"))
         activity["source_ids"] = [source["source_id"] for _, _, source, _ in related]
         activity["summary_source"] = "activities.json"
         if conflicts:
@@ -808,6 +967,8 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
                     activity["sensor_metadata"] = sensor_metadata
             elif method == "get_activity_details":
                 activity["stream"] = {"source_id": source["source_id"], **summarize_stream(data)}
+                if activity["is_running"]:
+                    private_routes[activity_id] = (source["source_id"], _private_route_points(data))
                 resource["normalization"] = "stream_profile"
             elif method in {"get_activity_splits", "get_activity_typed_splits"}:
                 laps = data.get("lapDTOs") if isinstance(data, dict) else data
@@ -819,7 +980,17 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
             elif method == "get_activity_weather":
                 weather = _select(data, WEATHER)
                 if weather:
-                    activity["weather"] = {"source_id": source["source_id"], "values": weather, "units": "Garmin source units retained; verify endpoint units before temperature/wind comparisons."}
+                    issued, started = _timestamp(weather.get("issueDate")), activity["start_gmt"]
+                    offset = None
+                    if issued and started:
+                        clocks = [datetime.fromisoformat(value.replace("Z", "+00:00")) for value in (issued, started)]
+                        clocks = [value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value for value in clocks]
+                        offset = _rounded((clocks[0] - clocks[1]).total_seconds() / 60, 1)
+                    activity["weather"] = {"source_id": source["source_id"], "values": weather,
+                        "units": "Garmin source units retained; verify endpoint units before temperature/wind comparisons.",
+                        "unit_verification": "unverified: pinned garminconnect get_activity_weather passes the REST payload through without conversion or a unit contract; raw values alone do not establish Fahrenheit/Celsius or wind units",
+                        "observation_offset_from_run_start_minutes": offset,
+                        "interpretation": "Reported station-weather observation, not continuous exposure on the run. Station coordinates/identifiers are excluded; issueDate establishes timing only."}
                     resource["normalization"] = "curated_weather"
             elif method == "get_activity_gear":
                 rows = data if isinstance(data, list) else data.get("gear", []) if isinstance(data, dict) else []
@@ -843,6 +1014,9 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
     activities.sort(key=lambda row: (row["date"] or "", row["activity_id"] or ""))
     daily.sort(key=lambda row: (row["date"] or "", row["kind"], row["source_id"]))
     runs = [activity for activity in activities if activity["is_running"]]
+    route_coverage = _route_contexts(runs, private_routes)
+    # Coordinates remain transient local values, never part of the model bundle.
+    del private_routes
     streams = [run["stream"] for run in runs if isinstance(run.get("stream"), dict)]
     coverage = {
         "snapshot_status": _token(manifest.get("status")), "boundaries": boundaries,
@@ -878,8 +1052,12 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
             "empty_profiles": "Returned profiles without segments, including empty, unrecognized and unbinnable samples. Failed/unavailable endpoints are separate source statuses.",
         },
         "runs_with_laps": sum("laps" in row for row in runs),
+        "route_context": route_coverage,
+        "runs_with_explicit_timezone": sum(bool(row["time_context"]["iana_timezone"]) for row in runs),
+        "runs_with_explicit_hr_sensor_metadata": sum(any(record["values"].get("antplusDeviceType") == "HEART_RATE" for record in row.get("sensor_metadata", [])) for row in runs),
         "daily_dates_by_kind": {kind: sorted({row["date"] for row in daily if row["kind"] == kind and row["date"]}) for kind in sorted({row["kind"] for row in daily})},
         "daily_records_without_date": sum(row["date"] is None for row in daily),
+        "sleep": _sleep_coverage(daily, boundaries, sources),
         "daily_values_normalized_to_null": len(quality_notes),
         "calibration_records_by_kind": dict(Counter(row["kind"] for row in calibration)),
         "usable_metric_date_counts": _metric_date_counts(daily),
@@ -889,6 +1067,8 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
     limitations = [
         "Observed Garmin data only: no medical diagnosis, injury clearance, lactate-threshold estimate, finish-time forecast or causal claim is computed.",
         "Activity names/descriptions, owner identifiers, precise coordinates and route polylines are excluded. Provided locationName remains as authorized area context; no geocoding occurs.",
+        "Anonymous route groups express bilateral spatial corridor overlap only, not identical direction, laps, terrain, weather or effort. Coordinates are used transiently on the local machine and never serialized in this bundle; group IDs are local to this bundle.",
+        "Explicit event timezones and paired timestamp offsets support date-aware comparisons but do not establish country. Blank locationName stays unknown, including during travel. Prefer UTC sleep endpoints; upstream documents possible double offsets in local sleep timestamps.",
         "Daily total steps include running; do not add them to running load or infer non-running steps without aligned evidence.",
         "Garmin readiness, load, HRV and sleep may share inputs; agreement does not imply independent confirmation.",
         "Missing values remain null. Empty weeks mean no observed runs, not proof of no activity. Boundary weeks may be partial.",
@@ -911,6 +1091,7 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
               "capacity_metrics": capacity_metrics,
               "daily_units": {kind: _daily_units(kind) for kind in sorted({row["kind"] for row in daily}) if _daily_units(kind)},
               "resources": resources, "data_quality_notes": quality_notes, "limitations": limitations}
+    bundle["longitudinal_metrics"] = build_longitudinal_metrics(bundle)
     _safe_write(output_dir / "evidence.json", json.dumps(bundle, indent=2, allow_nan=False) + "\n")
     _safe_write(output_dir / "evidence.md", _markdown(bundle))
     return bundle
@@ -921,6 +1102,8 @@ def _markdown(bundle: dict) -> str:
     lines = ["# Garmin training evidence", "", "This is an offline evidence bundle, not a coaching verdict.", "",
              f"Activities: {coverage['activity_count']}; runs: {coverage['running_count']}; stream responses: {coverage['runs_with_streams']}; usable stream profiles: {coverage['runs_with_usable_stream_profiles']}; responses without segments: {coverage['runs_with_empty_stream_profiles']}.",
              f"Call coverage: {json.dumps(coverage['call_status_counts'], sort_keys=True)}. Normalization errors: {coverage['normalization_error_count']}.",
+             f"Sleep: {coverage['sleep']['dates_with_positive_total_sleep_count']} dates with positive recorded sleep out of {coverage['sleep']['expected_date_count']} requested dates; {coverage['sleep']['dates_with_records_count']} dates have returned records, including empty placeholders.",
+             f"Source context: {coverage['runs_with_explicit_timezone']} runs with explicit timezones; {coverage['runs_with_explicit_hr_sensor_metadata']} with an explicitly categorized HR sensor listed; {coverage['route_context']['runs_with_matched_corridors']} runs in {coverage['route_context']['matched_group_count']} anonymous shared-corridor groups.",
              "", "## Observed weekly running", "", "| Week starting | Runs | Days | Recorded km | Longest km | Missing distances | Partial week |", "|---|---:|---:|---:|---:|---:|---|"]
     for week in bundle["weeks"]:
         values = (week["week_start"], week["run_count"], week["running_days"], week["recorded_distance_km"], week["longest_run_km"], week["distance_missing_count"], week["partial_boundary_week"])
@@ -936,6 +1119,10 @@ def _markdown(bundle: dict) -> str:
     lines += ["", "## Capacity evidence index", "",
               f"HR-quality records: {len(capacity['heart_rate_quality']['runs'])}; selected sustained windows: {len(capacity['sustained_windows'])}; long-window review candidates: {len(capacity['long_steady_candidates'])}.",
               "The capacity_metrics section contains exact-distance weekly summaries, HR coverage checks and bounded continuous-window observations. Screening flags require terrain, effort, sensor and recovery review; these are not physiological thresholds or a finish-time forecast."]
+    longitudinal = bundle["longitudinal_metrics"]
+    lines += ["", "## Longitudinal evidence index", "",
+              f"Aligned runs: {longitudinal['coverage']['aligned_run_count']}; daily timeline: {longitudinal['coverage']['daily_timeline_days']} days; usable completed sleep records: {longitudinal['coverage']['sleep']['usable_completed_sleep_records']}.",
+              "The longitudinal_metrics section aligns preceding sleep, prior running and daily movement with subsequent run observations, and lists qualified descriptive associations. Time alignment and route grouping do not establish causation or remove unmeasured confounding."]
     lines += ["", "## Evidence usage", "", "Use evidence.json for dated activities, laps, bounded terrain/pace/HR profiles, curated daily records and source ids. Unknown resources are available for local review but not copied into model context.", "", "## Limitations", ""]
     lines += [f"- {limitation}" for limitation in bundle["limitations"]]
     return "\n".join(lines) + "\n"

@@ -2,7 +2,7 @@
 
 Connect Garmin, establish what your completed training supports, then assess your goal and build a provisional race strategy and training plan.
 
-Nine specialists first review capacity without receiving your goal. They cross-examine the evidence, synthesize current capacity, and only then consider your goal. A separate model audit challenges the proposed strategy and plan before publication. You can inspect the evidence, individual findings, disagreements, and final proposal. The app does not upload workouts or change your Garmin calendar.
+The evidence builder connects preceding sleep, running load, comparable pace/HR observations and subsequent recovery. Nine specialists review capacity before receiving your goal. After cross-review and capacity synthesis, two planners independently propose training approaches; a lead compares their actual benefits and costs. A separate audit must pass both evidence checks and eight coaching-quality criteria before publication. You can inspect the evidence, individual findings, disagreements, and final proposal. The app does not upload workouts or change your Garmin calendar.
 
 This is a local Python application and authenticated local API. Garmin collection stays on your computer. **AI analysis sends curated training and health information to Codex using your own ChatGPT login.** It uses your Codex allowance and is not an offline AI system.
 
@@ -60,9 +60,9 @@ uv run gtl analyze \
   --share-with-codex
 ```
 
-`--share-with-codex` authorizes sending the curated evidence and goal to your Codex account. A new full analysis uses **21–25 Codex calls**: nine independent reviews, nine cross-reviews, a goal-blind capacity synthesis, a strategy/plan proposal, and an independent audit. Up to two revisions and re-audits are allowed. Unresolved audit findings prevent publication of a final plan. Concurrency can be 1, 2, or 3; this changes simultaneous work, not the number of roles. Analysis uses Codex's default model unless you pass `--model` explicitly, and requests high reasoning effort. Choose a model your Codex account supports; unavailable models fail explicitly.
+`--share-with-codex` authorizes sending the curated evidence and goal to your Codex account. A new full analysis uses **23–27 Codex calls**: nine independent reviews, nine cross-reviews, a goal-blind capacity synthesis, two independent candidate plans, a comparison/selection, and an independent audit. Up to two revisions and re-audits are allowed. Unresolved audit findings prevent publication of a final plan. Concurrency can be 1, 2, or 3; this changes simultaneous work, not the number of roles. Analysis uses Codex's default model unless you pass `--model` explicitly, and requests high reasoning effort. Choose a model your Codex account supports; unavailable models fail explicitly.
 
-Read `.local/runs/first-review/report.md` for the assessment and proposed plan. `final.json` holds the structured result only after a passing audit and structural checks. `capacity.json` preserves the assessment made before seeing the goal, and `audit.json` records the final challenge. Rejected drafts remain private and are not served as final API results. The `independent/` and `roundtable/` directories retain each specialist's contribution; `run.json` records progress. Model logs stay inside the private run directory.
+Read `.local/runs/first-review/report.md` for the assessment and proposed plan. `final.json` holds the structured result only after a passing audit and structural checks. `capacity.json` preserves the assessment made before seeing the goal. `planning_candidates.json` retains both candidate plans and their structural checks; `audit.json` records the final challenge and any workflow publication-gate errors. The report explains why one approach was selected and how completed sessions change subsequent training. Rejected drafts remain private and are not served as final API results. The `independent/` and `roundtable/` directories retain each specialist's contribution; `run.json` records progress. Model logs stay inside the private run directory.
 
 The plan begins after the collection cutoff. With a race date, it covers up to the race or 12 weeks, whichever comes first. Without a date, it covers four weeks. Refresh old evidence before asking for a current plan.
 
@@ -88,6 +88,8 @@ Each specialist must distinguish observations, estimates, heuristics, and unknow
 - Detailed daily summaries, readiness, hydration, and nutrition reads cover only the final 28 days of the requested period.
 - Selected runs include summary, laps, sampled chart details, recorded weather, gear, and heart-rate zones. Charts request up to 20,000 points; this is not a guarantee of full-resolution streams. Original FIT files are not downloaded.
 - Collection also requests latest and date-bounded lactate-threshold estimates, configured HR zones/profile settings, and bounded device metadata. Current settings are retrieval-time observations, not a reconstruction of past settings. Device estimates and configured HRmax are not measured physiological calibration. Unknown units stay unknown.
+- Missing sleep dates receive a bounded daily fallback after range collection. Empty daily responses remain explicit coverage limits.
+- Deterministic longitudinal summaries join the last completed sleep episode to each run using timestamps, include preceding workload, and examine later recovery and comparable-run associations. Matching uses one observation per run, reports sample sizes and sensitivity limits, and does not establish causation.
 - Deterministic capacity summaries report exact weekly load, HR coverage, and bounded sustained-window candidates. Selection thresholds are processing heuristics, not validated marathon-readiness tests.
 - A raw endpoint being collected does not mean every field reaches the model. The evidence builder uses known fields and marks resources it cannot normalize. Some metrics depend on device, account features, recording habits, and Garmin availability.
 - Running contributes to daily steps. Missing food logs do not mean no food; missing runs do not prove rest. Garmin measurements cannot establish injury recovery, workout intent, or in-run fueling without supporting notes.
@@ -100,6 +102,8 @@ Repeat `sync` with the same snapshot identifier and the same date arguments to r
 Cached successful responses, including empty responses, are observations from the original collection. **Use a new snapshot identifier to refresh data**, especially today's activities. The CLI's default snapshot name is today's date, so use explicit names when making multiple fresh snapshots in one day.
 
 Repeat analysis with the same run identifier to reuse valid stage outputs under identical inputs. If the goal, evidence, model, or protocol changes, choose a new run identifier.
+
+The revision limit is per run, not per resume. Resuming an exhausted audit failure reuses its saved drafts and does not buy another round of attempts. Review the failure and correct its underlying input or protocol issue before starting a new run. `run.json` distinguishes the provider's audit verdict from the effective publication status; an incomplete coaching review cannot publish merely by returning a pass label.
 
 The default `.local/` directory is ignored by Git. To keep all personal state outside the checkout, put the global option **before** the command:
 
@@ -114,7 +118,7 @@ Use that same option for subsequent commands, or set `GTL_STATE_DIR`. Each athle
 
 Private state contains Garmin session tokens, raw health/activity responses, goals, curated evidence, and generated reports. Directories and files use owner-only permissions on systems supporting them. Do not commit this state or attach raw data or private logs to public issues. A custom state directory placed elsewhere inside the checkout needs its own ignore rule.
 
-The curated model input excludes precise coordinates, route polylines, owner identifiers, and activity names/descriptions. Activity IDs, dates, health metrics, and provided `locationName` area context remain. This is sensitive personal information, not an anonymous dataset. The runner supplies the curated input directory and uses Codex's read-only sandbox, but **read-only is not filesystem isolation**; it does not guarantee the process cannot read other files accessible to your operating-system account.
+The curated model input excludes precise coordinates, route polylines, owner identifiers, and activity names/descriptions. Private coordinates may be used locally to derive anonymous route-comparison groups; these are not exact route identities. Activity IDs, dates, health metrics, and provided `locationName` area context remain. This is sensitive personal information, not an anonymous dataset. The runner supplies the curated input directory and uses Codex's read-only sandbox, but **read-only is not filesystem isolation**; it does not guarantee the process cannot read other files accessible to your operating-system account.
 
 Start the optional API with:
 

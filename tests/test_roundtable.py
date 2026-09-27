@@ -14,8 +14,10 @@ from garmin_training.core import read_json, write_json
 from garmin_training.goals import Goal, parse_finish_time
 from garmin_training.protocol import (
     CAPACITY_SCHEMA,
+    COACHING_QUALITY_CRITERIA,
     FINAL_AUDIT_SCHEMA,
     FINAL_SCHEMA,
+    PLAN_CANDIDATE_PROMPTS,
     PROPOSED_WEEK,
     REVIEW_SCHEMA,
     ROLES,
@@ -40,7 +42,7 @@ def schema_fixture(schema):
     if kind == "object":
         return {key: schema_fixture(value) for key, value in schema["properties"].items()}
     if kind == "array":
-        return []
+        return [schema_fixture(schema["items"]) for _ in range(schema.get("minItems", 0))]
     if kind == "boolean":
         return False
     if kind in {"number", "integer"}:
@@ -71,6 +73,13 @@ def example_final():
     defaults = schema_fixture(FINAL_SCHEMA)
     defaults.update(result)
     result = defaults
+    comparison = result["planning_comparison"]
+    comparison_schema = FINAL_SCHEMA["properties"]["planning_comparison"]["properties"]
+    comparison["options_considered"] = [
+        {**schema_fixture(comparison_schema["options_considered"]["items"]), "option_id": key}
+        for key in PLAN_CANDIDATE_PROMPTS
+    ]
+    comparison["decision_rules"] = [schema_fixture(comparison_schema["decision_rules"]["items"])]
     result["race_strategy"]["hr_basis"] = "unknown"
     baseline = result["training_rationale"]["achieved_baseline"]
     baseline.update(window_start="2026-09-01", window_end="2026-09-27", weekly_distance_km=40)
@@ -91,7 +100,9 @@ def stage_answer(stage, role):
     if stage == "capacity":
         return schema_fixture(CAPACITY_SCHEMA)
     if stage == "audit":
-        return schema_fixture(FINAL_AUDIT_SCHEMA)
+        result = schema_fixture(FINAL_AUDIT_SCHEMA)
+        result["checks"] = [{"area": area, "result": "pass", "reason": "Synthetic reviewed criterion", "evidence": ["synthetic-activity-1"]} for area in COACHING_QUALITY_CRITERIA]
+        return result
     return example_final()
 
 
@@ -122,12 +133,21 @@ def offline(tmp_path, monkeypatch):
             assert not (workspace / "goal.json").exists()
             assert "target_time_seconds" not in str(read_json(workspace / "athlete_context.json"))
             assert not (workspace.parent / "planning").exists() or (run_dir / "capacity.json").exists()
+        elif stage == "planning_candidates":
+            assert workspace.name == role
+            assert workspace.parent.name == "candidates"
+            assert (workspace / "goal.json").is_file()
+            assert (workspace / "capacity.json").is_file()
+            assert not (workspace / "planning_candidates.json").exists()
+            assert not (workspace / "draft.json").exists()
         else:
             assert workspace.name == "planning"
             assert (workspace / "goal.json").is_file()
             assert (workspace / "capacity.json").is_file()
         if stage == "capacity":
             assert set(read_json(workspace / "roundtable.json")) == set(ROLES)
+        if stage == "planning":
+            assert set(read_json(workspace / "planning_candidates.json")) == set(PLAN_CANDIDATE_PROMPTS)
         result = deepcopy(behavior["final"]) if stage in {"planning", "revision"} and behavior["final"] is not None else stage_answer(stage, role)
         if stage in {"audit", "revision"}:
             assert "validation.json" in prompt
@@ -135,6 +155,8 @@ def offline(tmp_path, monkeypatch):
         if stage == "revision" and behavior["revision_final"] is not None:
             result = deepcopy(behavior["revision_final"])
         if stage == "capacity":
+            result["summary"] += f"; fixture revision {behavior['revision']}"
+        if stage == "planning_candidates":
             result["summary"] += f"; fixture revision {behavior['revision']}"
         if stage == "audit" and behavior["audit"] is not None:
             result = deepcopy(behavior["audit"])
@@ -153,18 +175,67 @@ def offline(tmp_path, monkeypatch):
 def test_goal_blind_capacity_plan_audit_and_validated_resume(offline):
     evidence, run, calls, _ = offline
     result = rt.run_analysis(evidence, example_goal(), run, concurrency=3)
-    assert len(calls) == 21
+    assert len(calls) == 23
     assert {role for stage, role, _ in calls if stage == "independent"} == set(ROLES)
     assert {role for stage, role, _ in calls if stage == "roundtable"} == set(ROLES)
     assert [role for stage, role, _ in calls if stage == "planning"] == ["lead"]
+    assert {role for stage, role, _ in calls if stage == "planning_candidates"} == set(PLAN_CANDIDATE_PROMPTS)
     assert read_json(run / "run.json")["status"] == "complete"
-    assert read_json(run / "run.json")["completed_calls"] == 21
+    assert read_json(run / "run.json")["completed_calls"] == 23
     assert read_json(run / "final.json") == result
     assert "Synthetic assessment" in (run / "report.md").read_text()
     assert stat.S_IMODE((run / "final.json").stat().st_mode) == 0o600
     assert stat.S_IMODE((run / "report.md").stat().st_mode) == 0o600
     assert rt.run_analysis(evidence, example_goal(), run) == result
-    assert len(calls) == 21
+    assert len(calls) == 23
+
+
+def test_failed_candidate_keeps_capacity_but_prevents_publication_and_resumes(offline):
+    evidence, run, calls, behavior = offline
+    behavior["failure"] = ("planning_candidates", "development")
+    with pytest.raises(RuntimeError, match="SYNTHETIC_PRIVATE_PROVIDER_ERROR"):
+        rt.run_analysis(evidence, example_goal(), run)
+    assert (run / "capacity.json").is_file()
+    assert not (run / "final.json").exists()
+    assert not any(stage == "planning" for stage, _, _ in calls)
+    behavior["failure"] = None
+    before = len(calls)
+    rt.run_analysis(evidence, example_goal(), run)
+    assert calls[before:] == [("planning_candidates", "development", None),
+                             ("planning", "lead", None), ("audit", "reviewer-0", None)]
+
+
+def test_candidate_change_invalidates_selection_and_audit_only(offline):
+    evidence, run, calls, behavior = offline
+    rt.run_analysis(evidence, example_goal(), run)
+    (run / "planning_candidates" / "development.json").unlink()
+    behavior["revision"] = 1
+    before = len(calls)
+    rt.run_analysis(evidence, example_goal(), run)
+    assert calls[before:] == [("planning_candidates", "development", None),
+                             ("planning", "lead", None), ("audit", "reviewer-0", None)]
+
+
+def test_audit_cannot_omit_coaching_quality_checks(offline):
+    evidence, run, _, behavior = offline
+    behavior["audit"] = schema_fixture(FINAL_AUDIT_SCHEMA)
+    with pytest.raises(RuntimeError, match="audit did not pass"):
+        rt.run_analysis(evidence, example_goal(), run)
+    assert not (run / "final.json").exists()
+    assert len(read_json(run / "audit.json")["required_changes"]) == len(COACHING_QUALITY_CRITERIA)
+    assert read_json(run / "audit" / "reviewer-2.json")["required_changes"] == []
+    assert read_json(run / "run.json")["provider_audit_verdict"] == "pass"
+    assert read_json(run / "run.json")["audit_status"] == "revise"
+
+
+@pytest.mark.parametrize("mutation", ["fail", "unknown", "duplicate"])
+def test_coaching_quality_requires_one_passing_result_per_criterion(mutation):
+    audit = stage_answer("audit", "reviewer")
+    if mutation == "duplicate":
+        audit["checks"].append(deepcopy(audit["checks"][0]))
+    else:
+        audit["checks"][0]["result"] = mutation
+    assert len(rt.coaching_audit_errors(audit)) == 1
 
 
 def test_failed_specialist_prevents_publication_and_can_resume(offline):
@@ -248,7 +319,7 @@ def test_regenerated_upstream_answer_invalidates_downstream_caches(offline):
     assert [(stage, role) for stage, role, _ in new_calls if stage == "independent"] == [("independent", "training_history")]
     assert {role for stage, role, _ in new_calls if stage == "roundtable"} == set(ROLES)
     assert [role for stage, role, _ in new_calls if stage == "planning"] == ["lead"]
-    assert len(new_calls) == 13
+    assert len(new_calls) == 15
 
 
 def test_invalid_final_does_not_publish(offline):
@@ -258,7 +329,7 @@ def test_invalid_final_does_not_publish(offline):
     behavior["final"] = invalid
     with pytest.raises(RuntimeError, match="audit did not pass"):
         rt.run_analysis(evidence, example_goal(), run)
-    assert len(calls) == 25
+    assert len(calls) == 27
     assert read_json(run / "run.json")["deterministic_validation_status"] == "fail"
     assert "future planning window" in read_json(run / "inputs" / "planning" / "validation.json")["errors"][0]
     assert all(not record["passed"] for _, record in behavior["validation_seen"])
@@ -274,12 +345,12 @@ def test_invalid_plan_resume_keeps_drafts_and_rechecks_changed_revision(offline)
     behavior["final"] = invalid
     with pytest.raises(RuntimeError, match="audit did not pass"):
         rt.run_analysis(evidence, example_goal(), run)
-    assert len(calls) == 25
+    assert len(calls) == 27
     assert (run / "planning" / "lead.json").is_file()
     assert (run / "planning" / "lead.cache.json").is_file()
     state = read_json(run / "run.json")
     assert state["stages"]["planning"]["lead"] == "complete"
-    assert state["completed_calls"] == 25
+    assert state["completed_calls"] == 27
     assert not (run / "final.json").exists()
 
     before = len(calls)
@@ -290,7 +361,7 @@ def test_invalid_plan_resume_keeps_drafts_and_rechecks_changed_revision(offline)
     result = rt.run_analysis(evidence, example_goal(), run)
     assert calls[before:] == [("revision", "lead-2", None), ("audit", "reviewer-2", None)]
     assert read_json(run / "run.json")["status"] == "complete"
-    assert read_json(run / "run.json")["completed_calls"] == 25
+    assert read_json(run / "run.json")["completed_calls"] == 27
     assert read_json(run / "run.json")["new_calls_this_attempt"] == 2
     assert (run / "planning" / "lead.cache.json").is_file()
     assert read_json(run / "final.json") == result
@@ -303,7 +374,7 @@ def test_deterministic_error_is_repaired_before_publication_even_if_auditor_says
     behavior["final"] = invalid
     behavior["revision_final"] = example_final()
     result = rt.run_analysis(evidence, example_goal(), run)
-    assert len(calls) == 23
+    assert len(calls) == 25
     assert result["weekly_plan"][0]["distance_km"] == 42
     assert read_json(run / "audit" / "reviewer-0.validation.json")["passed"] is False
     assert read_json(run / "audit" / "reviewer-1.validation.json")["passed"] is True
@@ -323,7 +394,7 @@ def test_changed_validation_invalidates_audit_cache_even_with_unchanged_draft(of
     monkeypatch.setattr(rt, "validate_final", new_check)
     with pytest.raises(RuntimeError, match="audit did not pass"):
         rt.run_analysis(evidence, example_goal(), run)
-    assert calls[before:] == [("audit", "reviewer-0", None), ("revision", "lead-1", None),
+    assert calls[before:] == [("planning", "lead", None), ("audit", "reviewer-0", None), ("revision", "lead-1", None),
                              ("audit", "reviewer-1", None), ("revision", "lead-2", None),
                              ("audit", "reviewer-2", None)]
     assert not (run / "final.json").exists()
@@ -471,7 +542,7 @@ def test_unresolved_audit_blocks_publication_after_bounded_revisions(offline, ve
     behavior["audit"] = audit
     with pytest.raises(RuntimeError, match="audit did not pass"):
         rt.run_analysis(evidence, example_goal(), run)
-    assert len(calls) == 25
+    assert len(calls) == 27
     assert not (run / "final.json").exists()
     assert not (run / "report.md").exists()
     assert read_json(run / "run.json")["audit_status"] == verdict

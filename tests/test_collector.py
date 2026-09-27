@@ -24,11 +24,14 @@ class FakeGarmin:
         return result
 
     def __getattr__(self, name):
-        if name not in collector.RANGE_METHODS + collector.DAILY_METHODS + collector.DETAIL_METHODS + collector.CALIBRATION_METHODS:
+        if name not in collector.RANGE_METHODS + collector.DAILY_METHODS + collector.DETAIL_METHODS + collector.CALIBRATION_METHODS + collector.FALLBACK_METHODS:
             raise AttributeError(name)
 
         def call(*args, **kwargs):
             self.calls.append((name, args, kwargs))
+            if name == "get_sleep_daily" and name not in self.responses:
+                first, last = map(date.fromisoformat, args)
+                return [{"calendarDate": (first + timedelta(days=index)).isoformat(), "values": {"totalSleepTimeInSeconds": 28_800}} for index in range((last - first).days + 1)]
             result = self.responses.get(name, [])
             if isinstance(result, Exception):
                 raise result
@@ -154,7 +157,11 @@ def test_resume_interruption_preserves_successful_later_calls(tmp_path):
     final = collect(final_client, tmp_path)
     assert final["status"] == "complete"
     assert [name for name, _, _ in final_client.calls] == ["get_sleep_daily"]
-    assert final["counts"]["cached_calls"] == first["counts"]["successful_calls"]
+    # Repaired range summaries make the two earlier fallback reads unnecessary,
+    # but their successful cache entries must survive the interrupted resume.
+    fallback_count = sum(row["method"] == "get_sleep_data" for row in first["calls"])
+    assert final["counts"]["cached_calls"] == first["counts"]["successful_calls"] - fallback_count
+    assert {row["key"] for row in first["calls"] if row["status"] in {"ok", "empty"}} <= {row["key"] for row in final["resume_cache"]}
 
 
 def test_missing_client_capabilities_are_explicit(tmp_path):
@@ -273,3 +280,63 @@ def test_explicit_primary_training_device_is_prioritized_over_old_registered_dev
     assert settings == [("404",), ("101",), ("202",)]
     assert manifest["calibration_policy"]["explicit_primary_device_prioritized"] is True
     assert len(settings) == collector.MAX_DEVICE_SETTINGS
+
+
+def test_missing_sleep_fallback_recovers_only_requested_dates_and_resumes(tmp_path):
+    class SleepClient(FakeGarmin):
+        def get_sleep_data(self, day):
+            self.calls.append(("get_sleep_data", (day,), {}))
+            return {"dailySleepDTO": {"calendarDate": day, "sleepTimeSeconds": 25_200}}
+
+    client = SleepClient(responses={"get_sleep_daily": [
+        {"calendarDate": "2026-06-01", "values": {"totalSleepTimeInSeconds": 28_800}},
+        {"calendarDate": "2026-06-02", "values": {"totalSleepTimeInSeconds": None}},
+        {"calendarDate": "2026-06-03", "values": {"totalSleepTimeInSeconds": 0}},
+        {"calendarDate": "2026-05-30", "values": {"totalSleepTimeInSeconds": 28_800}},
+    ]})
+    first = collect(client, tmp_path, end=date(2026, 6, 4), max_details=0)
+    assert [args[0] for method, args, _ in client.calls if method == "get_sleep_data"] == ["2026-06-04", "2026-06-03", "2026-06-02"]
+    policy = first["sleep_fallback_policy"]
+    assert policy["range_usable_date_count"] == 1
+    assert policy["recovered_dates"] == ["2026-06-02", "2026-06-03", "2026-06-04"]
+    assert policy["missing_dates_after_fallback"] == []
+    resumed_client = SleepClient()
+    resumed = collect(resumed_client, tmp_path, end=date(2026, 6, 4), max_details=0)
+    assert resumed_client.calls == []
+    assert resumed["sleep_fallback_policy"] == policy
+    raw = next(row for row in resumed["calls"] if row["method"] == "get_sleep_data")
+    (tmp_path / raw["raw_path"]).write_text("{}")
+    refreshed_client = SleepClient()
+    collect(refreshed_client, tmp_path, end=date(2026, 6, 4), max_details=0)
+    assert refreshed_client.calls == [("get_sleep_data", tuple(raw["args"]), {})]
+
+
+def test_sleep_fallback_ceiling_is_newest_first_and_reports_remaining_dates(tmp_path):
+    start, end = date(2026, 1, 1), date(2026, 3, 3)
+    client = FakeGarmin(responses={"get_sleep_daily": []})
+    manifest = collect(client, tmp_path, start=start, end=end, max_details=0)
+    reads = [args[0] for method, args, _ in client.calls if method == "get_sleep_data"]
+    assert len(reads) == collector.MAX_SLEEP_FALLBACK_DAYS == 60
+    assert reads[0] == end.isoformat()
+    assert reads[-1] == (end - timedelta(days=59)).isoformat()
+    policy = manifest["sleep_fallback_policy"]
+    assert policy["truncated"] is True
+    assert len(policy["missing_dates_after_fallback"]) == 62
+    assert manifest["status"] == "partial"
+
+
+@pytest.mark.parametrize("response,expected_status", [
+    ({"dailySleepDTO": {"calendarDate": "2026-05-31", "sleepTimeSeconds": 28_800}}, "complete"),
+    (RuntimeError("HTTP 503 private sleep response"), "partial"),
+    (NotImplementedError(), "partial"),
+    (RuntimeError("HTTP 429 private sleep response"), "interrupted"),
+])
+def test_sleep_fallback_does_not_turn_wrong_dates_or_failures_into_recovery(tmp_path, response, expected_status):
+    client = FakeGarmin(responses={"get_sleep_daily": [], "get_sleep_data": response})
+    manifest = collect(client, tmp_path, max_details=0)
+    assert manifest["status"] == expected_status
+    assert manifest["sleep_fallback_policy"]["recovered_dates"] == []
+    assert manifest["sleep_fallback_policy"]["missing_dates_after_fallback"] == ["2026-06-01", "2026-06-02"]
+    assert "private sleep response" not in (tmp_path / "manifest.json").read_text()
+    if expected_status == "interrupted":
+        assert sum(method == "get_sleep_data" for method, _, _ in client.calls) == 1

@@ -103,7 +103,7 @@ def main(argv=None):
                     raise ValueError("Review the evidence, then add --share-with-codex to authorize AI processing")
                 goal_value = read_json(state / "goal.json")
                 run_dir = state / "runs" / validate_id(args.run)
-                print("Starting 9 goal-blind analysts, 9 cross-reviews, capacity assessment, planning and independent audit (21–25 calls). This uses your Codex allowance.", flush=True)
+                print("Starting 9 goal-blind analysts, 9 cross-reviews, capacity assessment, two candidate plans, plan selection and independent audit (23–27 calls). This uses your Codex allowance.", flush=True)
                 run_analysis(evidence_dir / "evidence.json", goal_value, run_dir, args.concurrency, args.model)
                 print(f"Assessment and proposed plan: {run_dir / 'report.md'}")
         elif args.command == "serve":

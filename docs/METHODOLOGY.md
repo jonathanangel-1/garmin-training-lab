@@ -62,15 +62,27 @@ For example, late-run slowing might reflect fatigue, a climb, a programmed coold
 
 The nineteenth call synthesizes current capacity without the goal: calibration, observed pace/HR for explicit durations and conditions, durability, documented strength, achieved training baseline and unknowns. It is saved as `capacity.json` and remains unchanged when the objective is introduced.
 
-The twentieth call reads that assessment before receiving the goal. It separates goal feasibility from current capacity, develops a provisional race strategy, and explains each training dose against the completed baseline. A goal is neither a predicted finish time nor a reason to force arbitrary overload or a blanket rest plan.
+The twentieth and twenty-first calls independently read that assessment and then the goal. They use separate supplied working directories and do not receive each other’s proposals. Each develops a defensible approach, compares plausible nearby doses, and connects the performance limitation to training and update rules. One emphasizes development; the other tests a meaningfully different tradeoff without being forced into rest or greater load. A target is not a predicted result, and an observed maximum is not a physiological ceiling.
 
-The twenty-first call independently challenges the draft against source evidence. It checks unsupported HR targets, projections, pain assumptions, constraint violations, load rationale, weekly arithmetic, and goal anchoring. A pass requires no blockers, required changes or failed checks. Otherwise, at most two revision/re-audit cycles are allowed. Deterministic draft errors are supplied to the audit and revision stages as `validation.json`, so the same bounded repair loop can correct them. Failure retains private drafts but publishes no final report or API result. A passing model audit is a review outcome, not clinical or predictive validation.
+The twenty-second call compares the actual candidate submissions, their expected benefit, fatigue cost, evidence and assumptions. It selects or synthesizes a coherent plan. If the candidates agree, the report acknowledges convergence instead of inventing disagreement. The final comparison must identify both candidates, and the proposed sessions must implement the selected approach.
 
-A new run therefore uses 21–25 Codex calls, with concurrency 1–3 for the specialist stages. Resumption reuses schema-valid, semantically valid stage outputs only when inputs, prompts, schemas, implementation and upstream output fingerprints match. Progress records distinguish completed stages from new calls made in that attempt.
+The twenty-third call independently challenges the draft against source evidence and both candidate submissions. It checks unsupported HR targets, projections, pain assumptions, constraint violations, load rationale, weekly arithmetic, and goal anchoring. A pass requires no blockers, required changes or failed checks, plus exactly one passing entry for each named coaching-quality criterion: performance-gap link, nearby-option comparison, development versus assessment, actionable update rules, context and constraints, longitudinal evidence, uncertainty/load balance, and a coherent actionable prescription. An inconclusive measurement may be appropriately handled; the gate does not require positive findings, numeric HR targets or a claimed optimal plan. Otherwise, at most two revision/re-audit cycles are allowed. Deterministic draft errors are supplied to the audit and revision stages as `validation.json`, so the same bounded repair loop can correct them. Failure retains private drafts but publishes no final report or API result. A passing model audit is a review outcome, not clinical or predictive validation.
+
+A new run therefore uses 23–27 Codex calls, with concurrency 1–3 for specialist and candidate stages. Resumption reuses schema-valid, semantically valid stage outputs only when inputs, prompts, schemas, implementation and upstream output fingerprints match. Progress records distinguish completed stages from new calls made in that attempt.
 
 ### Deterministic capacity summaries
 
 The evidence bundle also contains `capacity_metrics`: weekly loads recomputed from normalized metres/seconds, complete-week baselines, longest runs, HR-zone coverage and bounded continuous-window candidates. It does not generate a race prediction or calibrated HR zone. Coverage, pause, pace-variability and outlier flags expose selection limits. They are operational filters and not physiological pass/fail thresholds. HR means derived from profile bins remain sample-weighted; repeated terrain can still confound comparisons. The run-level and segment source records remain available for challenge.
+
+### Longitudinal connections
+
+`longitudinal_metrics` connects completed sleep episodes to run starts using GMT timestamps. Calendar-date equality alone is insufficient, particularly around travel or runs preceding that day’s main sleep. Predictors use only preceding observations. Rolling sleep and completed running load retain coverage counts. Daily steps include running; steps on dates without recorded runs are labeled separately and are not called verified rest-day activity.
+
+Pace/HR comparisons use at most one observation per run. Matched comparisons report selection criteria, independent run counts, date separation, terrain/location context and residual confounding. Overlapping windows are not independent samples. Exploratory associations and stricter matched sensitivity checks have different evidential weight. A sparse result remains sparse rather than receiving manufactured precision.
+
+Recovery summaries compare measurements after eligible longer or demanding runs with prior personal observations, retain intervening activity, and distinguish true timed sleep/HRV windows from date-only resting-HR context. Neither association nor return toward baseline establishes injury status or guaranteed readiness. Athlete explanations such as vacation and usual running frequency remain provenance-labeled testimony, not inferred diagnoses.
+
+A bounded missing-sleep fallback supplements range reads. Coordinates, when available, support local anonymous route grouping; the curated output contains no coordinates or coordinate hashes. IANA timezones can align times but do not establish country. Weather units are only converted when source metadata supports them.
 
 ## 5. Interpretation rules and their basis
 
@@ -100,7 +112,7 @@ Elevation totals and kilometer splits do not reconstruct the slopes inside each 
 
 [Garmin's Training Readiness documentation](https://www8.garmin.com/manuals/webhelp/GUID-31D23DBB-57C2-4DF7-A0C9-8D1A00AB4BE7/EN-US/GUID-C21BE0C8-A08E-4DA1-B6C6-2E0E2DDDB372.html) lists sleep, recovery time, HRV, acute load, and recent sleep/stress history among its inputs. These signals overlap. Agreement between readiness and its component metrics partly reflects score construction and must not be presented as several independent findings.
 
-The analysts compare personal baselines and dated patterns. They cannot diagnose an illness, injury, or cause of poor performance from these metrics alone. Athlete notes about symptoms and tolerance remain necessary when they materially affect a prescription.
+The [2021 athlete sleep consensus](https://pubmed.ncbi.nlm.nih.gov/33144349/) supports individualized assessment and identifies limits in evidence about partial sleep restriction. The analysts compare personal baselines and dated patterns. They cannot diagnose an illness, injury, or cause of poor performance from these metrics alone. Athlete notes about symptoms and tolerance remain necessary when they materially affect a prescription.
 
 ### Tapering and remaining workload
 
