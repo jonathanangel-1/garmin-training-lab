@@ -168,7 +168,7 @@ def render_report(result: dict) -> str:
     for title, key in [("Small tweaks", "small_tweaks"), ("Constraints checked", "constraints_checked"),
                        ("Unresolved disagreements", "unresolved_disagreements"), ("Missing information", "missing_information")]:
         lines += ["", f"## {title}", ""] + [f"- {text}" for text in result[key]]
-    lines += ["", "This is a proposal. No Garmin workout or calendar entry was changed.", ""]
+    lines += ["", "This is a proposal. The workflow processed curated evidence through Codex using your ChatGPT login and saved local reports. No Garmin workout or calendar entry was changed.", ""]
     return "\n".join(lines)
 
 

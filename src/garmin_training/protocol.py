@@ -29,6 +29,10 @@ independent evidence. The user's target is a goal, not evidence that it is achie
 Use the dataset cutoff as the assessment date. Historical age of observations matters.
 Preserve stated constraints; a maximum number of hard sessions is not a quota.
 Provide concise consequential findings, not an inventory of every metric.
+Do not turn missing evidence into certain future failure or a definite claim that preparation
+cannot improve. Separate what the recorded history establishes from what remains uncertain.
+Report training and evidence constraints only. Do not make claims about the whole workflow's
+file writes, external services, privacy, or agent launches based on your own read-only role.
 """
 
 
