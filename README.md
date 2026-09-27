@@ -10,6 +10,8 @@ This is a local Python application and authenticated local API. Garmin collectio
 
 You need Python 3.12 or later, Git, [uv](https://docs.astral.sh/uv/getting-started/installation/), a Garmin account, and a current [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) with ChatGPT access. Install Codex separately using its official instructions. This project checks for the non-interactive CLI features it uses before starting analysis. CLI 0.157.1 was verified with `gpt-6-astra`; older CLIs may reject newer models even when login works.
 
+This release is tested on macOS and Linux. On Windows, use a Linux environment such as WSL; native Windows operation is not validated.
+
 ```sh
 git clone https://github.com/jonathanangel-1/garmin-training-lab.git
 cd garmin-training-lab
