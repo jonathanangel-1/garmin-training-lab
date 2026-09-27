@@ -1,0 +1,12 @@
+{
+  "description": "Prepare for a 10 km race with consistent, sustainable training",
+  "race_date": "2027-05-09",
+  "distance_km": 10,
+  "target_time_seconds": 3300,
+  "max_stressors_per_week": 2,
+  "constraints": [
+    "At most four running days per week",
+    "Keep Friday as a rest day"
+  ],
+  "notes": "Synthetic example only. Replace with your current symptoms, schedule, training context, and practiced fueling."
+}

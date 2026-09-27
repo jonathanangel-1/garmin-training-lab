@@ -1,0 +1,210 @@
+"""Offline tests: local-date inclusion, bounded reads, resume, and interruptions."""
+
+import hashlib
+import json
+import stat
+from datetime import date, timedelta
+
+import pytest
+
+from garmin_training import collector
+
+
+class FakeGarmin:
+    def __init__(self, pages=None, responses=None):
+        self.pages = pages or {}
+        self.responses = responses or {}
+        self.calls = []
+
+    def get_activities(self, offset, limit):
+        self.calls.append(("get_activities", (offset, limit), {}))
+        result = self.pages.get(offset, [])
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def __getattr__(self, name):
+        if name not in collector.RANGE_METHODS + collector.DAILY_METHODS + collector.DETAIL_METHODS:
+            raise AttributeError(name)
+
+        def call(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            result = self.responses.get(name, [])
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return call
+
+
+def activity(identifier, local, kind="running", **fields):
+    return {"activityId": identifier, "startTimeLocal": local, "activityType": {"typeKey": kind}, **fields}
+
+
+def collect(fake, folder, start=date(2026, 6, 1), end=date(2026, 6, 2), **kwargs):
+    kwargs.setdefault("request_pause", 0)
+    return collector.collect_snapshot(fake, folder, start, end, **kwargs)
+
+
+def test_local_dates_all_types_pagination_dedup_and_missing_fields(tmp_path):
+    run = activity(2, "2026-06-01 23:50:00", distance=1234, startTimeGMT="2026-06-02 03:50:00")
+    walk = activity(3, "2026-06-02 06:30:00", "walking")
+    missing_date = {"activityId": 5, "distance": None}
+    fake = FakeGarmin(pages={
+        0: [activity(4, "2026-06-03 00:05:00"), walk, run, missing_date],
+        100: [run, activity(1, "2026-05-31 22:00:00", startTimeGMT="2026-06-01 02:00:00")],
+    })
+    manifest = collect(fake, tmp_path, max_details=1)
+    saved = json.loads((tmp_path / "activities.json").read_text())
+    assert saved == [run, walk]
+    assert "averageHR" not in saved[0]
+    assert manifest["counts"]["unclassified_local_dates"] == 1
+    assert manifest["status"] == "partial"
+    assert manifest["activity_history_boundary_reached"] is True
+    assert manifest["selected_activity_ids"] == [2]
+    assert [args[0] for name, args, _ in fake.calls if name == "get_activities"] == [0, 100, 200]
+    assert json.loads((tmp_path / "activities_unclassified.json").read_text()) == [missing_date]
+
+
+def test_windows_daily_bound_selection_and_stream_sampling_are_explicit(tmp_path):
+    start, end = date(2026, 1, 1), date(2026, 3, 3)
+    runs = [activity(i, f"2026-03-0{i} 07:00:00", "trail_running") for i in (3, 2, 1)]
+    fake = FakeGarmin(pages={0: runs})
+    manifest = collect(fake, tmp_path, start, end, max_details=2)
+    for method in collector.RANGE_METHODS:
+        bounds = [args for name, args, _ in fake.calls if name == method]
+        assert bounds == [("2026-01-01", "2026-01-28"), ("2026-01-29", "2026-02-25"), ("2026-02-26", "2026-03-03")]
+        assert all((date.fromisoformat(b) - date.fromisoformat(a)).days < 28 for a, b in bounds)
+    daily_dates = [args[0] for name, args, _ in fake.calls if name == "get_user_summary"]
+    assert len(daily_dates) == 28
+    assert daily_dates[0] == (end - timedelta(days=27)).isoformat()
+    assert daily_dates[-1] == end.isoformat()
+    details = [(args, kwargs) for name, args, kwargs in fake.calls if name == "get_activity_details"]
+    assert details == [(("3",), {"maxchart": 20_000, "maxpoly": 20_000}), (("2",), {"maxchart": 20_000, "maxpoly": 20_000})]
+    assert manifest["detail_selection_truncated"] is True
+    assert manifest["sampling"]["potentially_sampled"] is True
+    assert manifest["status"] == "complete"
+
+
+def test_successful_and_empty_raw_calls_resume_without_network_and_verify_hashes(tmp_path):
+    fake = FakeGarmin(responses={"get_daily_steps": [{"calendarDate": "2026-06-01", "totalSteps": None}]})
+    first = collect(fake, tmp_path, max_details=0)
+    assert first["status"] == "complete"
+    assert first["counts"]["empty_calls"] > 0
+    second_client = FakeGarmin()
+    second = collect(second_client, tmp_path, max_details=0)
+    assert second_client.calls == []
+    assert second["counts"]["cached_calls"] == len(first["calls"])
+    assert second["counts"]["network_calls"] == 0
+    for call in second["calls"]:
+        content = (tmp_path / call["raw_path"]).read_bytes()
+        assert hashlib.sha256(content).hexdigest() == call["sha256"]
+        assert call["retrieved_at"] == next(row for row in first["calls"] if row["key"] == call["key"])["retrieved_at"]
+    steps = next(row for row in second["calls"] if row["method"] == "get_daily_steps")
+    (tmp_path / steps["raw_path"]).write_text("[]")
+    third_client = FakeGarmin()
+    third = collect(third_client, tmp_path, max_details=0)
+    assert [name for name, _, _ in third_client.calls] == ["get_daily_steps"]
+    assert third["counts"]["network_calls"] == 1
+
+
+@pytest.mark.parametrize("exception", [
+    type("GarminConnectTooManyRequestsError", (Exception,), {})("secret: do not persist"),
+    type("GarminConnectAuthenticationError", (Exception,), {})("password: do not persist"),
+    RuntimeError("API Error 429 - private response"),
+    RuntimeError("HTTP 401 private response"),
+])
+def test_auth_or_rate_limit_stops_without_more_calls_or_sensitive_errors(tmp_path, exception):
+    fake = FakeGarmin(responses={"get_sleep_daily": exception})
+    manifest = collect(fake, tmp_path)
+    assert manifest["status"] == "interrupted"
+    assert [name for name, _, _ in fake.calls] == ["get_activities", "get_daily_steps", "get_sleep_daily"]
+    failure = manifest["calls"][-1]
+    assert failure["status"] == "interrupted"
+    assert failure["raw_path"] is None
+    rendered = (tmp_path / "manifest.json").read_text()
+    assert "private response" not in rendered
+    assert "do not persist" not in rendered
+    resumed_client = FakeGarmin()
+    resumed = collect(resumed_client, tmp_path)
+    assert resumed["status"] == "complete"
+    assert resumed["counts"]["cached_calls"] == 2
+    assert resumed_client.calls[0][0] == "get_sleep_daily"
+
+
+def test_unavailable_and_failed_calls_are_distinct_from_empty(tmp_path):
+    fake = FakeGarmin(responses={"get_hydration_data": NotImplementedError(), "get_nutrition_daily_meals": RuntimeError("API Error 503 private diagnostic")})
+    manifest = collect(fake, tmp_path)
+    assert manifest["status"] == "partial"
+    hydration = [row for row in manifest["calls"] if row["method"] == "get_hydration_data"]
+    assert [row["status"] for row in hydration] == ["unavailable", "unavailable"]
+    assert [row["attempted"] for row in hydration] == [True, False]
+    failed = [row for row in manifest["calls"] if row["method"] == "get_nutrition_daily_meals"]
+    assert all(row["status"] == "error" and row["raw_path"] is None for row in failed)
+    assert all(row["error"]["http_status"] == 503 for row in failed)
+
+
+def test_resume_interruption_preserves_successful_later_calls(tmp_path):
+    first = collect(FakeGarmin(responses={"get_sleep_daily": RuntimeError("HTTP 503")}), tmp_path)
+    assert first["status"] == "partial"
+    interrupted = collect(FakeGarmin(responses={"get_sleep_daily": RuntimeError("HTTP 401")}), tmp_path)
+    assert interrupted["status"] == "interrupted"
+    assert len(interrupted["calls"]) == 3
+    final_client = FakeGarmin()
+    final = collect(final_client, tmp_path)
+    assert final["status"] == "complete"
+    assert [name for name, _, _ in final_client.calls] == ["get_sleep_daily"]
+    assert final["counts"]["cached_calls"] == first["counts"]["successful_calls"]
+
+
+def test_missing_client_capabilities_are_explicit(tmp_path):
+    class MinimalClient:
+        def get_activities(self, *_):
+            return []
+
+    manifest = collect(MinimalClient(), tmp_path)
+    assert manifest["status"] == "partial"
+    assert manifest["counts"]["network_calls"] == 1
+    assert manifest["counts"]["unavailable_calls"] > 0
+    assert all(row["error"]["reason"] == "client_method_unavailable" for row in manifest["calls"][1:])
+
+
+def test_private_atomic_files_and_exact_payload_preservation(tmp_path):
+    payload = {"calendarDate": "2026-06-01", "newFirmwareField": {"unknown": [None, 1, "é"]}}
+    folder = tmp_path / "snapshot"
+    fake = FakeGarmin(responses={"get_user_summary": payload})
+    manifest = collect(fake, folder)
+    assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    assert stat.S_IMODE((folder / "raw").stat().st_mode) == 0o700
+    for file in folder.rglob("*.json"):
+        assert stat.S_IMODE(file.stat().st_mode) == 0o600
+    row = next(row for row in manifest["calls"] if row["method"] == "get_user_summary")
+    assert json.loads((folder / row["raw_path"]).read_text()) == payload
+    assert not list(folder.rglob(".collect-*"))
+    assert json.loads((folder / "manifest.json").read_text()) == manifest
+
+
+def test_repeated_activity_pages_cannot_loop_or_claim_complete_history(tmp_path):
+    page = [activity(1, "2026-06-01 07:00:00")]
+    fake = FakeGarmin(pages={0: page, 100: page})
+    manifest = collect(fake, tmp_path, max_details=0)
+    assert manifest["status"] == "partial"
+    assert manifest["activity_history_boundary_reached"] is False
+    assert {issue["reason"] for issue in manifest["completeness"]} == {"repeated_activity_page"}
+    assert manifest["counts"]["activities"] == 1
+
+
+@pytest.mark.parametrize("options", [
+    {"start": date(2026, 6, 3)},
+    {"detail_start": date(2026, 6, 3)},
+    {"max_details": -1},
+    {"max_details": 1001},
+    {"request_pause": float("nan")},
+])
+def test_invalid_inputs_fail_before_files_or_network(tmp_path, options):
+    fake = FakeGarmin()
+    folder = tmp_path / "should-not-exist"
+    with pytest.raises(ValueError):
+        collect(fake, folder, **options)
+    assert fake.calls == []
+    assert not folder.exists()
