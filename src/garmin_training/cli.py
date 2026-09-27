@@ -30,6 +30,8 @@ def parser():
     goal.add_argument("--max-stressors", type=int)
     goal.add_argument("--constraint", action="append", default=[])
     goal.add_argument("--notes-file", type=Path)
+    goal.add_argument("--observations-file", type=Path,
+                      help="JSON list of dated athlete observations, separate from the goal")
     sync = commands.add_parser("sync", help="Read Garmin into a resumable private snapshot")
     sync.add_argument("--start", type=date.fromisoformat, default=date.today() - timedelta(days=183))
     sync.add_argument("--end", type=date.fromisoformat, default=date.today())
@@ -38,7 +40,7 @@ def parser():
     sync.add_argument("--snapshot", default=date.today().isoformat())
     evidence = commands.add_parser("evidence", help="Prepare and inspect the curated AI input")
     evidence.add_argument("--snapshot", required=True)
-    analysis = commands.add_parser("analyze", help="Run nine analysts, their roundtable, and synthesis through Codex")
+    analysis = commands.add_parser("analyze", help="Assess capacity, then plan and independently audit through Codex")
     analysis.add_argument("--snapshot", required=True)
     analysis.add_argument("--run", default=date.today().isoformat())
     analysis.add_argument("--concurrency", type=int, choices=[1, 2, 3], default=3)
@@ -70,7 +72,8 @@ def main(argv=None):
             value = Goal(description=args.description, race_date=args.race_date,
                          distance_km=args.distance_km, target_time_seconds=args.target_time,
                          max_stressors_per_week=args.max_stressors, constraints=args.constraint,
-                         notes=args.notes_file.read_text() if args.notes_file else "")
+                         notes=args.notes_file.read_text() if args.notes_file else "",
+                         athlete_observations=read_json(args.observations_file) if args.observations_file else [])
             write_json(state / "goal.json", value.model_dump(mode="json"))
             print("Goal saved privately.")
         elif args.command == "sync":
@@ -100,7 +103,7 @@ def main(argv=None):
                     raise ValueError("Review the evidence, then add --share-with-codex to authorize AI processing")
                 goal_value = read_json(state / "goal.json")
                 run_dir = state / "runs" / validate_id(args.run)
-                print("Starting 9 independent analyses, 9 cross-reviews, and final synthesis. This uses your Codex allowance.", flush=True)
+                print("Starting 9 goal-blind analysts, 9 cross-reviews, capacity assessment, planning and independent audit (21–25 calls). This uses your Codex allowance.", flush=True)
                 run_analysis(evidence_dir / "evidence.json", goal_value, run_dir, args.concurrency, args.model)
                 print(f"Assessment and proposed plan: {run_dir / 'report.md'}")
         elif args.command == "serve":

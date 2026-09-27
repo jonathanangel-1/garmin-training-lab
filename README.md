@@ -1,8 +1,8 @@
 # Garmin Training Lab
 
-Connect your Garmin account, describe your running goal, and get an evidence-based assessment and proposed training plan from nine specialist Codex analysts.
+Connect Garmin, establish what your completed training supports, then assess your goal and build a provisional race strategy and training plan.
 
-The specialists review your training independently, challenge one another's conclusions, and produce one combined report. You can inspect the evidence, individual findings, disagreements, and final proposal. The app does not upload workouts or change your Garmin calendar.
+Nine specialists first review capacity without receiving your goal. They cross-examine the evidence, synthesize current capacity, and only then consider your goal. A separate model audit challenges the proposed strategy and plan before publication. You can inspect the evidence, individual findings, disagreements, and final proposal. The app does not upload workouts or change your Garmin calendar.
 
 This is a local Python application and authenticated local API. Garmin collection stays on your computer. **AI analysis sends curated training and health information to Codex using your own ChatGPT login.** It uses your Codex allowance and is not an offline AI system.
 
@@ -37,7 +37,7 @@ uv run gtl goal \
   --constraint "Keep Friday as a rest day"
 ```
 
-Add `--notes-file /path/to/your-notes.md` for context Garmin cannot establish: current symptoms, perceived effort, actual fueling, schedule limits, recent race results, or an existing plan. The notes become part of the AI input. A time target also requires a distance. Goal input is freeform, but this version's specialist protocol and plan format focus on running.
+Use `--observations-file /path/to/observations.json` for a JSON list of dated athlete reports: symptoms, effort, actual fueling, equipment or context. See [the synthetic example](examples/observations.json). These reports reach the capacity analysts. Put aspirations, schedule limits and prior coaching proposals in the goal/constraints or `--notes-file /path/to/notes.md`; those are withheld until planning. Existing notes are not automatically reclassified as evidence. Do not put a desired finish time or proposed schedule inside an observation. A time target also requires a distance. Goal input is freeform, but this version's specialist protocol and plan format focus on running.
 
 ### 2. Collect and inspect your evidence
 
@@ -60,9 +60,9 @@ uv run gtl analyze \
   --share-with-codex
 ```
 
-`--share-with-codex` authorizes sending the curated evidence and goal to your Codex account. A new full analysis uses **19 Codex calls**: nine independent analyses, nine cross-reviews, and one final synthesis. Concurrency can be 1, 2, or 3; this changes simultaneous work, not the number of roles. Analysis uses Codex's default model unless you pass `--model` explicitly, and requests high reasoning effort. Choose a model your Codex account supports; unavailable models fail explicitly.
+`--share-with-codex` authorizes sending the curated evidence and goal to your Codex account. A new full analysis uses **21–25 Codex calls**: nine independent reviews, nine cross-reviews, a goal-blind capacity synthesis, a strategy/plan proposal, and an independent audit. Up to two revisions and re-audits are allowed. Unresolved audit findings prevent publication of a final plan. Concurrency can be 1, 2, or 3; this changes simultaneous work, not the number of roles. Analysis uses Codex's default model unless you pass `--model` explicitly, and requests high reasoning effort. Choose a model your Codex account supports; unavailable models fail explicitly.
 
-Read `.local/runs/first-review/report.md` for the assessment and proposed plan. `final.json` holds the structured result. The `independent/` and `roundtable/` directories retain each specialist's contribution; `run.json` records progress. Model logs stay inside the private run directory.
+Read `.local/runs/first-review/report.md` for the assessment and proposed plan. `final.json` holds the structured result only after a passing audit and structural checks. `capacity.json` preserves the assessment made before seeing the goal, and `audit.json` records the final challenge. Rejected drafts remain private and are not served as final API results. The `independent/` and `roundtable/` directories retain each specialist's contribution; `run.json` records progress. Model logs stay inside the private run directory.
 
 The plan begins after the collection cutoff. With a race date, it covers up to the race or 12 weeks, whichever comes first. Without a date, it covers four weeks. Refresh old evidence before asking for a current plan.
 
@@ -71,22 +71,24 @@ The plan begins after the collection cutoff. With a race date, it covers up to t
 | Specialist | Main question |
 |---|---|
 | Training history | What preparation have you actually accumulated? |
-| Workout execution | What happened within the sessions, and what was their purpose where known? |
+| Calibration and quality | Which sensors, settings and threshold estimates are actually trustworthy for this inference? |
 | Terrain and environment | How do slopes, routes, and recorded weather affect comparisons? |
-| Cardiovascular fitness | What do credible pace and heart-rate patterns support? |
+| Pace and effort | What pace/HR relationships are demonstrated, for how long, under what conditions? |
 | Long-run endurance | Can you sustain the required work late in long efforts? |
 | Sleep and recovery | Which personal recovery patterns accompany training? |
-| Background load | How much walking, strength work, and other activity surrounds running? |
+| Background load and strength | What extra load or measured strength is documented, and what remains unknown? |
 | Fueling and hydration | What intake and tolerance are actually documented? |
 | Symptoms and mechanics | What do your notes, shoes, cadence, and available dynamics establish? |
 
-Each specialist must distinguish observations, estimates, heuristics, and unknowns. The lead reviewer resolves disagreements using source evidence, not vote counts. See [Methodology](docs/METHODOLOGY.md) for data coverage, interpretation rules, and limits.
+Each specialist must distinguish observations, estimates, heuristics, and unknowns. The capacity and planning reviewers resolve disagreements using source evidence, not vote counts. The final report explains feasibility, HR calibration limits, provisional race execution, and why each proposed week differs from the achieved baseline. A current pain-free report is not converted into an injury-return plan. See [Methodology](docs/METHODOLOGY.md) for data coverage, interpretation rules, and limits.
 
 ## Data coverage and limits
 
 - Six-month default collection includes activity summaries and range reads for steps, sleep summaries, resting heart rate, HRV, maximum metrics, and Body Battery where available. Range requests use windows of at most 28 days.
 - Detailed daily summaries, readiness, hydration, and nutrition reads cover only the final 28 days of the requested period.
 - Selected runs include summary, laps, sampled chart details, recorded weather, gear, and heart-rate zones. Charts request up to 20,000 points; this is not a guarantee of full-resolution streams. Original FIT files are not downloaded.
+- Collection also requests latest and date-bounded lactate-threshold estimates, configured HR zones/profile settings, and bounded device metadata. Current settings are retrieval-time observations, not a reconstruction of past settings. Device estimates and configured HRmax are not measured physiological calibration. Unknown units stay unknown.
+- Deterministic capacity summaries report exact weekly load, HR coverage, and bounded sustained-window candidates. Selection thresholds are processing heuristics, not validated marathon-readiness tests.
 - A raw endpoint being collected does not mean every field reaches the model. The evidence builder uses known fields and marks resources it cannot normalize. Some metrics depend on device, account features, recording habits, and Garmin availability.
 - Running contributes to daily steps. Missing food logs do not mean no food; missing runs do not prove rest. Garmin measurements cannot establish injury recovery, workout intent, or in-run fueling without supporting notes.
 - This is an initial implementation, not a clinically validated coaching system or a performance guarantee. Watch metrics and model agreement do not establish a diagnosis or prove a goal is achievable.

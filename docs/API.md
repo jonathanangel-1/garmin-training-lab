@@ -100,7 +100,7 @@ print(analysis_job)
 
 Replace the fictional example goal before use. This request uses the goal in its body, not the CLI's saved `goal.json`.
 
-The API uses the runner's defaults: concurrency 3 and Codex's default model. Use the CLI for a different concurrency or explicit model. A full new run makes nine independent calls, nine cross-reviews, and one synthesis.
+The API uses the runner's defaults: concurrency 3 and Codex's default model. Use the CLI for a different concurrency or explicit model. A full new run makes 21–25 calls: nine goal-blind specialists, nine cross-reviews, capacity synthesis, planning and independent audit, with up to two revision/audit cycles. Only an audit with a pass verdict and no blockers, required changes or failed checks allows a final result.
 
 ### Goal object
 
@@ -112,7 +112,10 @@ The API uses the runner's defaults: concurrency 3 and Codex's default model. Use
 | `target_time_seconds` | Optional integer, 1–604,800; requires `distance_km` |
 | `max_stressors_per_week` | Optional integer, 0–7; a ceiling, not a required count |
 | `constraints` | Up to 30 strings, each at most 2,000 characters; defaults to `[]` |
-| `notes` | String up to 20,000 characters; defaults to `""` |
+| `notes` | Planning-only context, up to 20,000 characters; defaults to `""` |
+| `athlete_observations` | Up to 100 objects: `date` (ISO or null), `category` (`symptoms`, `effort`, `fueling`, `equipment`, `context`), `observation` (1–4,000 characters), `source` (1–1,000); defaults to `[]` |
+
+Dated athlete observations reach the capacity stage; goal description, race date, target, constraints and notes are introduced only after capacity synthesis. Keep aspirations and prior prescriptions out of observations. This is a data/prompt separation, not OS-level access isolation.
 
 Unknown fields are rejected. Model instructions use stated constraints, but only selected structural rules are checked automatically. Freeform constraints still require human review of the proposed sessions.
 
@@ -127,13 +130,15 @@ The job lock covers this API process only. Do not start CLI collection or analys
 After an analysis job completes, request `/v1/analyses/{analysis_id}`. The final object includes:
 
 - `summary`, `confidence`, and `goal_assessment` (`supported`, `conditional`, `not_supported`, or `insufficient_data`).
+- `capacity_summary`, `goal_feasibility`, and `race_strategy` with calibration provenance and conditional execution.
+- `training_rationale` with achieved baseline, numerical weekly comparisons and dose rationale; `assessment_actions` state what a check would establish and which session it replaces.
 - `current_status` describing fitness, fatigue, durability, and data quality.
 - `key_findings` with evidence, alternatives, observation/estimate/heuristic/unknown labels, and confidence.
-- `finish_time_estimates` with eligibility, lower/upper seconds, assumptions, reasons, and evidence. Ineligible methods have null times.
+- `finish_time_estimates` with eligibility, lower/upper seconds, assumptions, reasons, source basis, validity limits, and evidence. Ineligible methods have null times.
 - `weekly_plan` containing dated sessions, optional numeric distances/durations, stressor labels, adjustment triggers, and supporting evidence.
 - `small_tweaks`, `constraints_checked`, `unresolved_disagreements`, and `missing_information`.
 
-The local run also contains `report.md`, source stage outputs, and private model logs. An HTTP job marked failed does not imply no files were created; partial artifacts may remain locally, but the API serves a final result only after successful completion.
+The local run also contains `capacity.json`, `audit.json`, `report.md`, stage outputs and private model logs. A rejected proposal retains drafts and audits but has no `final.json` or `report.md`. An HTTP job marked failed does not imply no files were created; partial artifacts may remain locally, but the API serves a final result only after successful completion.
 
 ## Errors
 

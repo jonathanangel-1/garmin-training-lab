@@ -25,6 +25,7 @@ MAX_ACTIVITY_PAGES = 100
 ACTIVITY_PAGE_SIZE = 100
 DETAIL_CHART_LIMIT = 20_000
 DETAIL_POLYLINE_LIMIT = 20_000
+MAX_DEVICE_SETTINGS = 3
 
 RANGE_METHODS = (
     "get_daily_steps",
@@ -49,6 +50,16 @@ DETAIL_METHODS = (
     "get_activity_weather",
     "get_activity_gear",
     "get_activity_hr_in_timezones",
+)
+CALIBRATION_CURRENT_METHODS = (
+    "get_heart_rate_zones",
+    "get_user_profile",
+    "get_userprofile_settings",
+    "get_devices",
+    "get_primary_training_device",
+)
+CALIBRATION_METHODS = (
+    "get_lactate_threshold", *CALIBRATION_CURRENT_METHODS, "get_device_settings",
 )
 
 
@@ -288,6 +299,7 @@ def collect_snapshot(
         "counts": {"activities": 0, "selected_runs": 0, "eligible_runs": 0, "activity_pages": 0, "unclassified_local_dates": 0},
         "selection": {"max_details": max_details, "activity_page_size": ACTIVITY_PAGE_SIZE, "max_activity_pages": MAX_ACTIVITY_PAGES, "local_date_field": "startTimeLocal", "running_type_rule": "running, *_running, ultra_run, obstacle_run", "request_pause_seconds": request_pause},
         "sampling": {"maxChartSize": DETAIL_CHART_LIMIT, "maxPolylineSize": DETAIL_POLYLINE_LIMIT, "potentially_sampled": True, "original_fit_downloaded": False},
+        "calibration_policy": {"lactate_threshold_history": "daily aggregation within requested start/end", "latest_configuration": "retrieval-time state; not a historical configuration snapshot", "max_device_settings": MAX_DEVICE_SETTINGS},
     }
     state = _Collection(client, folder, manifest, float(request_pause))
     state.checkpoint()
@@ -377,6 +389,45 @@ def collect_snapshot(
             if state.interrupted:
                 break
         current += timedelta(days=1)
+    # New resources come after the existing collection sequence so successful
+    # prior calls retain their cache keys and can be resumed without refetching.
+    # Lactate threshold is a composite upstream read (2 requests latest, 3 range).
+    if not state.interrupted:
+        state.call("get_lactate_threshold", latest=True)
+    if not state.interrupted:
+        state.call("get_lactate_threshold", latest=False, start_date=start.isoformat(),
+                   end_date=end.isoformat(), aggregation="daily")
+    devices = []
+    primary_device_id = None
+    for method in CALIBRATION_CURRENT_METHODS:
+        if state.interrupted:
+            break
+        success, payload = state.call(method)
+        if method == "get_devices" and success and isinstance(payload, list):
+            devices = payload
+        if method == "get_primary_training_device" and success and isinstance(payload, dict):
+            primary = payload.get("PrimaryTrainingDevice") or payload.get("primaryTrainingDevice")
+            if isinstance(primary, dict):
+                value = primary.get("deviceId")
+                if not isinstance(value, bool) and re.fullmatch(r"[0-9]{1,30}", str(value)) and int(value) > 0:
+                    primary_device_id = str(value)
+    device_ids = []
+    for device in devices:
+        identifier = device.get("deviceId") if isinstance(device, dict) else None
+        if isinstance(identifier, bool) or identifier is None:
+            continue
+        identifier = str(identifier)
+        if re.fullmatch(r"[0-9]{1,30}", identifier) and int(identifier) > 0 and identifier not in device_ids:
+            device_ids.append(identifier)
+    if primary_device_id:
+        device_ids = [primary_device_id] + [identifier for identifier in device_ids if identifier != primary_device_id]
+    manifest["calibration_policy"]["explicit_primary_device_prioritized"] = primary_device_id is not None
+    manifest["calibration_policy"]["device_settings_truncated"] = len(device_ids) > MAX_DEVICE_SETTINGS
+    manifest["calibration_policy"]["eligible_device_settings"] = len(device_ids)
+    for identifier in device_ids[:MAX_DEVICE_SETTINGS]:
+        if state.interrupted:
+            break
+        state.call("get_device_settings", identifier)
     manifest["status"] = "interrupted" if state.interrupted else "partial" if manifest["errors"] or manifest["completeness"] else "complete"
     manifest["finished_at"] = _now()
     state.checkpoint()

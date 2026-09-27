@@ -1,8 +1,21 @@
 """User-supplied goals and constraints, kept separate from measured evidence."""
 
+import datetime as dt
 from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class AthleteObservation(BaseModel):
+    """Dated athlete testimony, distinct from aspirations and coaching preferences."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    date: dt.date | None = None
+    category: Literal["symptoms", "effort", "fueling", "equipment", "context"]
+    observation: str = Field(min_length=1, max_length=4000)
+    source: str = Field(min_length=1, max_length=1000)
 
 
 class Goal(BaseModel):
@@ -15,6 +28,7 @@ class Goal(BaseModel):
     max_stressors_per_week: int | None = Field(default=None, ge=0, le=7)
     constraints: list[str] = Field(default_factory=list, max_length=30)
     notes: str = Field(default="", max_length=20000)
+    athlete_observations: list[AthleteObservation] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
     def consistent_target(self):

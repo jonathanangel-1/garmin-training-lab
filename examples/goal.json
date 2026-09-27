@@ -8,5 +8,6 @@
     "At most four running days per week",
     "Keep Friday as a rest day"
   ],
-  "notes": "Synthetic example only. Replace with your current symptoms, schedule, training context, and practiced fueling."
+  "notes": "Synthetic example only. Replace with your planning context and preferences. Supply dated athlete reports separately.",
+  "athlete_observations": []
 }

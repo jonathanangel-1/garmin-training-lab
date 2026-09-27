@@ -330,6 +330,159 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(fields, {"distance_m", "duration_s", "avg_hr_bpm"})
         self.assertEqual(result["coverage"]["activities_with_summary_conflicts"], 1)
 
+    def test_threshold_latest_and_history_have_source_dates_and_explicit_uncertainty(self):
+        self.add_call("get_lactate_threshold", {
+            "speed_and_heart_rate": {"calendarDate": "2026-10-05", "heartRate": 169,
+                "speed": 4.25, "userProfilePK": 918273645, "displayName": "PRIVATE_OWNER"},
+            "power": {"calendarDate": "2026-10-05", "value": 300, "userProfilePK": 918273645},
+        }, kwargs={"latest": True}, retrieved_at="2026-10-06T12:00:00+00:00")
+        self.add_call("get_lactate_threshold", {
+            "heart_rate": [{"calendarDate": "2026-09-12", "value": 166, "userId": 918273645}],
+            "speed": {"values": [{"date": "2026-09-12", "value": 4.1}]},
+            "power": [{"calendarDate": "2026-09-12", "value": 295}],
+        }, kwargs={"latest": False, "start_date": "2026-09-01", "end_date": "2026-09-27", "aggregation": "daily"})
+
+        result = self.build()
+
+        latest = next(row for row in result["calibration"] if row["kind"] == "lactate_threshold_latest")
+        self.assertEqual(latest["values"]["threshold_hr_bpm"], 169)
+        self.assertEqual(latest["values"]["threshold_speed_source"], 4.25)
+        self.assertEqual(latest["classification"], "garmin_reported_estimate")
+        self.assertEqual(latest["temporal_scope"], "latest_at_retrieval")
+        self.assertTrue(latest["observation_after_cutoff"])
+        self.assertIn("unit unverified", latest["units"]["threshold_speed_source"])
+        history = [row for row in result["calibration"] if row["kind"] == "lactate_threshold_history"]
+        self.assertEqual(len(history), 3)
+        self.assertTrue(all(row["date"] == "2026-09-12" for row in history))
+        self.assertTrue(all(row["temporal_scope"] == "historical_daily" for row in history))
+        source = next(row for row in result["sources"] if row["source_id"] == history[0]["source_id"])
+        self.assertEqual(source["requested_date"], "2026-09-01")
+        self.assertEqual(source["requested_end"], "2026-09-27")
+        self.assertNotIn("918273645", json.dumps(result))
+        self.assertNotIn("PRIVATE_OWNER", json.dumps(result))
+
+    def test_configured_zones_and_profile_are_not_inferred_maximum_hr(self):
+        self.activities = [{"activityId": 101, "activityType": {"typeKey": "running"}, "maxHR": 217}]
+        self.add_call("get_heart_rate_zones", [{"sport": "RUNNING", "zone1Floor": 125,
+            "zone5Floor": 166, "calculationMethod": "PERCENT_MAX_HR", "userProfilePK": 918273645}])
+        self.add_call("get_user_profile", {"userData": {"maxHeartRate": 185, "restingHeartRate": 48,
+            "email": "private@example.invalid", "birthDate": "1900-01-01", "weight": 74000,
+            "userProfilePK": 918273645}})
+
+        result = self.build()
+
+        zones = next(row for row in result["calibration"] if row["kind"] == "configured_heart_rate_zones")
+        self.assertEqual(zones["values"]["zone5Floor"], 166)
+        self.assertNotIn("maxHeartRate", zones["values"])
+        configured = next(row for row in result["calibration"] if row["kind"] == "profile_heart_rate_configuration")
+        self.assertEqual(configured["values"]["maxHeartRate"], 185)
+        self.assertEqual(configured["classification"], "configured_value")
+        self.assertEqual(configured["temporal_scope"], "latest_at_retrieval")
+        self.assertEqual(result["runs"][0]["max_hr_bpm"], 217)
+        self.assertNotIn("217", json.dumps(result["calibration"]))
+        for secret in ("private@example.invalid", "1900-01-01", "74000", "918273645"):
+            self.assertNotIn(secret, json.dumps(result))
+
+    def test_device_and_activity_sensor_metadata_remove_identifiers_and_custom_names(self):
+        self.activities = [{"activityId": 101, "activityType": {"typeKey": "running"}}]
+        self.add_call("get_devices", [{"deviceId": 918273645, "displayName": "PRIVATE_OWNER_WATCH",
+            "productDisplayName": "Example Runner 2", "manufacturerName": "Example",
+            "serialNumber": "PRIVATE_SERIAL", "email": "private@example.invalid"}])
+        self.add_call("get_device_settings", {"heartRateSettings": {"maxHeartRate": 185},
+            "pairedSensors": [{"sensorType": "HEART_RATE", "connectionType": "ANT_PLUS",
+                "serialNumber": "PRIVATE_SERIAL", "deviceId": 918273645}]}, [918273645])
+        self.add_call("get_activity", {"metadataDTO": {"deviceManufacturer": "Example",
+            "heartRateSource": "CHEST_STRAP", "deviceId": 918273645,
+            "sensors": [{"sensorType": "HEART_RATE", "serialNumber": "PRIVATE_SERIAL"}]}}, [101])
+
+        result = self.build()
+
+        device = next(row for row in result["calibration"] if row["kind"] == "device_metadata")
+        self.assertEqual(device["values"]["productDisplayName"], "Example Runner 2")
+        self.assertEqual(device["classification"], "device_metadata")
+        self.assertTrue(any(row["values"].get("heartRateSource") == "CHEST_STRAP" for row in result["runs"][0]["sensor_metadata"]))
+        for secret in ("918273645", "PRIVATE_OWNER_WATCH", "PRIVATE_SERIAL", "private@example.invalid"):
+            self.assertNotIn(secret, json.dumps(result))
+
+    def test_unknown_calibration_schema_advertises_availability_without_dumping(self):
+        self.add_call("get_primary_training_device", {"accountName": "PRIVATE_OWNER",
+            "newPrivateSchema": {"secret": "PRIVATE_SECRET"}})
+        result = self.build()
+        self.assertEqual(result["calibration"], [])
+        self.assertEqual(result["resources"][0]["normalization"], "schema_not_supported")
+        self.assertNotIn("PRIVATE_OWNER", json.dumps(result))
+        self.assertNotIn("PRIVATE_SECRET", json.dumps(result))
+
+    def test_hr_sample_count_excludes_missing_and_nonpositive_samples(self):
+        details = {"metricDescriptors": [
+            {"key": "sumDistance", "metricsIndex": 0},
+            {"key": "directHeartRate", "metricsIndex": 1},
+        ], "activityDetailMetrics": [{"metrics": [0, 0]}, {"metrics": [100, 145]},
+            {"metrics": [200, None]}, {"metrics": [300, 155]}]}
+        segment = summarize_stream(details)["segments"][0]
+        self.assertEqual(segment["sample_count"], 4)
+        self.assertEqual(segment["hr_bpm_sample_count"], 2)
+        self.assertEqual(segment["mean_hr_bpm"], 150)
+        self.assertEqual(segment["min_hr_bpm"], 145)
+
+    def test_actual_history_period_schema_and_training_method_are_preserved(self):
+        self.add_call("get_lactate_threshold", {
+            "heart_rate": [{"from": "2026-07-11", "until": "2026-07-11", "series": "running",
+                "value": 171, "updatedDate": "2026-07-12"}],
+            "speed": [{"from": "2026-07-11", "until": "2026-07-11", "series": "running",
+                "value": 0.42, "updatedDate": "2026-07-12"}], "power": [],
+        }, kwargs={"latest": False, "start_date": "2026-07-01", "end_date": "2026-09-27", "aggregation": "daily"})
+        self.add_call("get_heart_rate_zones", [{"trainingMethod": "LACTATE_THRESHOLD",
+            "maxHeartRateUsed": 189, "lactateThresholdHeartRateUsed": 171,
+            "zone1Floor": 100, "restingHrAutoUpdateUsed": False, "sport": "DEFAULT"}])
+        self.add_call("get_user_profile", {"userData": {"lactateThresholdHeartRate": 171,
+            "lactateThresholdSpeed": 0.42, "thresholdHeartRateAutoDetected": True}})
+
+        result = self.build()
+
+        history = [row for row in result["calibration"] if row["kind"] == "lactate_threshold_history"]
+        self.assertEqual(len(history), 2)
+        for row in history:
+            self.assertEqual(row["date"], "2026-07-11")
+            self.assertEqual(row["date_basis"], "from")
+            self.assertEqual(row["period_end"], "2026-07-11")
+            self.assertEqual(row["source_updated_date"], "2026-07-12")
+        speed = next(row for row in history if "threshold_speed_source" in row["values"])
+        self.assertEqual(speed["values"]["threshold_speed_source"], 0.42)
+        self.assertIn("unverified", speed["units"]["threshold_speed_source"])
+        zones = next(row for row in result["calibration"] if row["kind"] == "configured_heart_rate_zones")
+        self.assertEqual(zones["values"]["trainingMethod"], "LACTATE_THRESHOLD")
+        profile = next(row for row in result["calibration"] if row["kind"] == "profile_heart_rate_configuration")
+        self.assertTrue(profile["values"]["thresholdHeartRateAutoDetected"])
+
+    def test_primary_device_join_preserves_unicode_model_without_exposing_device_identity(self):
+        self.add_call("get_devices", [{"deviceId": 918273645, "productDisplayName": "Example fēnix – AMOLED",
+            "hasOpticalHeartRate": True, "displayName": "PRIVATE_CUSTOM_NAME", "serialNumber": "PRIVATE_SERIAL"}])
+        self.add_call("get_primary_training_device", {"PrimaryTrainingDevice": {"deviceId": 918273645}})
+        self.add_call("get_device_settings", {"deviceId": 918273645, "opticalHeartRateEnabled": False}, [918273645])
+
+        result = self.build()
+
+        primary = next(row for row in result["calibration"] if row["kind"] == "primary_training_device")
+        self.assertEqual(primary["values"]["productDisplayName"], "Example fēnix – AMOLED")
+        self.assertIn("supporting_source_id", primary)
+        settings = next(row for row in result["calibration"] if row.get("values", {}).get("opticalHeartRateEnabled") is False)
+        self.assertEqual(settings["device_context"]["values"]["productDisplayName"], "Example fēnix – AMOLED")
+        for secret in ("918273645", "PRIVATE_CUSTOM_NAME", "PRIVATE_SERIAL"):
+            self.assertNotIn(secret, json.dumps(result))
+
+    def test_capacity_metrics_integration_uses_observations_without_inferring_true_maximum(self):
+        self.activities = [{"activityId": 101, "activityType": {"typeKey": "running"},
+            "startTimeLocal": "2026-09-21 08:00:00", "distance": 10500.25,
+            "duration": 3200, "maxHR": 217, "averageHR": 148}]
+        result = self.build()
+        capacity = result["capacity_metrics"]
+        self.assertEqual(capacity["heart_rate_quality"]["true_max_hr_status"], "not_established")
+        self.assertEqual(capacity["heart_rate_quality"]["observed_peak"]["bpm"], 217)
+        self.assertFalse(capacity["calibration"]["provided"])
+        self.assertEqual(len(capacity["heart_rate_quality"]["runs"]), 1)
+        self.assertIn("Capacity evidence index", (self.output / "evidence.md").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

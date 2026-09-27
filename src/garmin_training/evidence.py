@@ -19,6 +19,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from .capacity_metrics import build_capacity_metrics
+
 SCHEMA_VERSION = 1
 MAX_SEGMENTS = 256
 MAX_LAPS = 500
@@ -275,6 +277,9 @@ def summarize_stream(details: Any) -> dict:
             vals = [point[key] for point in points if point.get(key) is not None]
             if not any(dest == key for _, dest, _ in mapping.values()):
                 continue
+            if key == "hr_bpm":
+                vals = [value for value in vals if value > 0]
+                segment["hr_bpm_sample_count"] = len(vals)
             segment[f"mean_{key}"] = _rounded(sum(vals) / len(vals)) if vals else None
             segment[f"min_{key}"] = _rounded(min(vals)) if vals else None
             segment[f"max_{key}"] = _rounded(max(vals)) if vals else None
@@ -299,6 +304,7 @@ def summarize_stream(details: Any) -> dict:
         "assumed_garmin_units_for": sorted(assumptions),
         "cadence_convention": "directRunCadence and directDoubleCadence are retained as separate source channels even when both advertise stepsPerMinute. Do not treat the former as total steps/min or silently double it. Summary averageRunningCadenceInStepsPerMinute remains the explicit total-step field.",
         "descriptor_factor_policy": "Metric values are already decoded; descriptor unit.factor is metadata and is never multiplied or divided into samples. Recognized explicit unit keys alone control unit conversion.",
+        "heart_rate_sample_policy": "Nonpositive heart-rate samples are invalid/missing and excluded from mean/min/max and hr_bpm_sample_count. Sample coverage is not duration coverage or proof of sensor accuracy.",
         "sampling_note": "May already be downsampled by Garmin. Means are sample weighted, bin edges are observed points, ascent/descent omit inter-bin edges and depend on sampling; use summary gain/loss for total terrain.",
         "decoupling": {"status": "not_computed", "reason": "Steady effort, comparable terrain/weather, stops, fueling and workout purpose have not been independently validated; length alone does not establish eligibility."},
         "segments": segments,
@@ -330,6 +336,8 @@ def _select(data: Any, schema: dict) -> dict:
             selected[key] = _timestamp(value)
         elif kind == "token":
             selected[key] = _token(value)
+        elif kind == "label" and isinstance(value, str) and re.fullmatch(r"[\w .,/+()–—®™-]{1,120}", value):
+            selected[key] = value
     return selected
 
 
@@ -349,6 +357,134 @@ SLEEP_RANGE_VALUES = {
     **_numeric_schema("remTime", "restingHeartRate", "respiration", "localSleepEndTimeInMillis", "awakeTime", "spO2", "localSleepStartTimeInMillis", "sleepScore", "lightTime", "avgOvernightHrv", "totalSleepTimeInSeconds", "deepTime", "sleepNeed", "bodyBatteryChange", "gmtSleepStartTimeInMillis", "gmtSleepEndTimeInMillis", "skinTempF", "skinTempC", "avgHeartRate", "hrv7dAverage"),
     "sleepAlignmentStatus": "token", "hrvStatus": "token", "sleepScoreQuality": "token",
 }
+HR_CONFIGURATION = {
+    **_numeric_schema("maxHeartRate", "maximumHeartRate", "restingHeartRate", "lactateThresholdHeartRate", "lactateThresholdSpeed", "maxHeartRateUsed", "restingHeartRateUsed", "lactateThresholdHeartRateUsed"),
+    **_numeric_schema(*(f"zone{number}{suffix}" for number in range(1, 6) for suffix in ("Floor", "Ceiling", "LowerBoundary", "UpperBoundary", "Percent"))),
+    "sport": "token", "sportType": "token", "calculationMethod": "token",
+    "zoneCalculationMethod": "token", "heartRateCalculationMethod": "token",
+    "heartRateZonesCalculationMethod": "token", "zoneType": "token",
+    "trainingMethod": "token", "restingHrAutoUpdateUsed": "bool",
+    "thresholdHeartRateAutoDetected": "bool", "ftpAutoDetected": "bool",
+    "autoDetectMaxHeartRate": "bool", "autoDetectLactateThreshold": "bool",
+    "maxHeartRateAutoDetected": "bool", "lactateThresholdAutoDetected": "bool",
+}
+DEVICE_METADATA = {
+    "manufacturer": "label", "manufacturerName": "label", "deviceManufacturer": "label",
+    "productName": "label", "productDisplayName": "label", "modelName": "label",
+    "deviceTypeSimpleName": "label", "hasOpticalHeartRate": "bool",
+    "opticalHeartRateEnabled": "bool", "lactateThresholdAutoDetectEnabled": "bool",
+    "deviceType": "token", "productType": "token", "deviceCategory": "token",
+    "softwareVersion": "token", "firmwareVersion": "token", "sensorType": "token",
+    "connectionType": "token", "isPrimaryTrainingDevice": "bool", "isPrimaryWearable": "bool",
+    "heartRateSource": "token", "hrSource": "token",
+}
+CALIBRATION_CONTAINERS = {
+    "data", "values", "daily", "dailyStats", "metrics", "stats", "entries",
+    "userData", "userSettings", "userHeartRateSettings", "heartRateSettings",
+    "heartRateZones", "runningHeartRateZones", "cyclingHeartRateZones", "zones",
+    "running", "cycling", "default", "settings", "sportProfiles", "activityProfiles",
+    "runningSettings", "devices", "primaryTrainingDevice", "primaryWearable",
+    "device", "deviceInfo", "deviceSettings", "sensors", "connectedSensors", "pairedSensors",
+    "sensorSettings", "sensorDetails", "metadataDTO", "deviceMetaDataDTO",
+}
+
+
+def _calibration_nodes(data: Any, path: str = "root", depth: int = 0):
+    """Walk only named schema containers; arbitrary raw nested content is not copied."""
+    if depth > 6:
+        return
+    if isinstance(data, list):
+        for index, value in enumerate(data[:1000]):
+            yield from _calibration_nodes(value, f"{path}[{index}]", depth + 1)
+    elif isinstance(data, dict):
+        yield path, data
+        for key in sorted(CALIBRATION_CONTAINERS):
+            if key in data:
+                yield from _calibration_nodes(data[key], f"{path}.{key}", depth + 1)
+
+
+def _calibration_records(method: str, data: Any, source: dict, kwargs: dict, cutoff: str | None) -> list[dict]:
+    records = []
+    historical = method == "get_lactate_threshold" and kwargs.get("latest") is False
+
+    def add(kind: str, values: dict, row: dict, path: str, classification: str, units: dict, note: str):
+        if not values or not any(value is not None for value in values.values()):
+            return
+        date_field = next((key for key in ("calendarDate", "date", "from", "updatedDate") if _date(row.get(key))), None)
+        observation_date = _date(row.get(date_field)) if date_field else None
+        records.append({
+            "kind": kind, "classification": classification,
+            "source_id": source["source_id"], "source_field": path,
+            "date": observation_date, "retrieved_at": source["retrieved_at"],
+            "date_basis": date_field,
+            "period_start": _date(row.get("from")), "period_end": _date(row.get("until")),
+            "source_updated_date": _date(row.get("updatedDate")),
+            "temporal_scope": "historical_daily" if historical else "latest_at_retrieval",
+            "historical_cutoff": cutoff,
+            "observation_after_cutoff": observation_date > cutoff if observation_date and cutoff else None,
+            "values": values, "units": units,
+            "interpretation": note,
+        })
+
+    if method == "get_lactate_threshold" and isinstance(data, dict):
+        note = "Garmin-reported threshold estimate or saved value; automatic detection, manual entry and test provenance are not established. Not laboratory-validated. Latest composite speed and HR can originate on different dates."
+        if historical:
+            channels = (("heart_rate", "threshold_hr_bpm", "bpm", ("heartRate", "hearRate", "lactateThresholdHeartRate", "value")),
+                        ("speed", "threshold_speed_source", "Garmin source speed unit unverified; do not convert to pace", ("speed", "lactateThresholdSpeed", "value")),
+                        ("power", "threshold_power_source", "Garmin source power unit unverified", ("functionalThresholdPower", "power", "value")))
+            for channel, destination, unit, keys in channels:
+                for path, row in _calibration_nodes(data.get(channel), channel):
+                    value = _num(_first(row, *keys))
+                    if value is not None and value > 0:
+                        add("lactate_threshold_history", {destination: value}, row, path,
+                            "garmin_reported_estimate", {destination: unit}, note)
+        else:
+            combined = data.get("speed_and_heart_rate")
+            if isinstance(combined, dict):
+                values = {}
+                for destination, keys in (("threshold_hr_bpm", ("heartRate", "hearRate")),
+                                          ("threshold_speed_source", ("speed",)),
+                                          ("cycling_threshold_hr_bpm", ("heartRateCycling",))):
+                    value = _num(_first(combined, *keys))
+                    if value is not None and value > 0:
+                        values[destination] = value
+                add("lactate_threshold_latest", values, combined, "speed_and_heart_rate",
+                    "garmin_reported_estimate", {"threshold_hr_bpm": "bpm", "cycling_threshold_hr_bpm": "bpm",
+                    "threshold_speed_source": "Garmin source speed unit unverified; do not convert to pace"}, note)
+            for path, row in _calibration_nodes(data.get("power"), "power"):
+                values = _select(row, _numeric_schema("value", "functionalThresholdPower", "powerToWeight", "power"))
+                if any(_num(value) is not None and value > 0 for value in values.values()):
+                    add("threshold_power_latest", values, row, path, "garmin_reported_estimate",
+                        {"values": "Garmin source units; power and power-to-weight must not be conflated"}, note)
+    elif method in {"get_heart_rate_zones", "get_user_profile", "get_userprofile_settings", "get_device_settings"}:
+        for path, row in _calibration_nodes(data):
+            values = _select(row, HR_CONFIGURATION)
+            has_hr_value = any(_num(value) is not None for value in values.values())
+            if has_hr_value:
+                add("configured_heart_rate_zones" if method == "get_heart_rate_zones" else "profile_heart_rate_configuration",
+                    values, row, path, "configured_value",
+                    {"heart_rate_fields": "bpm as configured; not a measured maximum", "zone_floors": "source zone boundaries; interpret with configured calculation method", "zone_percent_fields": "percent", "lactateThresholdSpeed": "Garmin source speed unit unverified; do not convert to pace"},
+                    "Current configuration at retrieval; may differ from configuration at historical activity dates. Do not derive a true maximum HR from zone boundaries or from observed activity peaks.")
+    if method in {"get_devices", "get_primary_training_device", "get_device_settings"}:
+        for path, row in _calibration_nodes(data):
+            values = _select(row, DEVICE_METADATA)
+            add("device_metadata", values, row, path, "device_metadata", {},
+                "Current account/device metadata. Presence or pairing does not establish which sensor measured HR on any historical run; custom names, IDs and serials are omitted.")
+    return records
+
+
+def _activity_sensor_metadata(data: dict, source_id: str) -> list[dict]:
+    records = []
+    metadata = data.get("metadataDTO")
+    candidates = [("activity", data)]
+    if isinstance(metadata, dict):
+        candidates += list(_calibration_nodes(metadata, "metadataDTO"))
+    for path, row in candidates:
+        values = _select(row, DEVICE_METADATA)
+        if values:
+            records.append({"source_id": source_id, "source_field": path, "values": values,
+                            "interpretation": "Reported per-activity metadata only. A watch model or paired sensor is not proof of the HR source unless an explicit source field identifies it."})
+    return records
 
 
 def _body_battery_observations(item: dict) -> dict:
@@ -543,6 +679,8 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
     boundaries = {key: _date((manifest.get("boundaries") or {}).get(key)) for key in ("start", "end", "detail_start", "daily_start")}
     sources, resources, daily, loaded = [], [], [], defaultdict(list)
     quality_notes = []
+    calibration = []
+    device_catalog = {}
     calls = manifest.get("calls") or []
     if not isinstance(calls, list):
         raise ValueError("manifest calls must contain a list")
@@ -556,11 +694,13 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
         args = call.get("args") if isinstance(call.get("args"), list) else []
         kwargs = call.get("kwargs") if isinstance(call.get("kwargs"), dict) else {}
         activity_id = _id(args[0]) if args and method.startswith("get_activity") else None
-        requested_date = _date(args[0]) if args and not activity_id else None
+        requested_date = _date(args[0]) if args and not activity_id else _date(kwargs.get("start_date"))
         source = {"source_id": f"call:{index:05d}", "method": method, "status": status,
                   "activity_id": activity_id, "requested_date": requested_date,
-                  "requested_end": _date(args[1]) if len(args) > 1 and not activity_id else None,
+                  "requested_end": _date(args[1]) if len(args) > 1 and not activity_id else _date(kwargs.get("end_date")),
                   "retrieved_at": _timestamp(call.get("retrieved_at"))}
+        if method == "get_lactate_threshold":
+            source["calibration_request"] = _select(kwargs, {"latest": "bool", "aggregation": "token"})
         if method == "get_activity_details":
             source["sampling_request"] = {key: _num(kwargs.get(key)) for key in ("maxchart", "maxpoly") if key in kwargs}
         data, raw_path, failure = (None, None, None)
@@ -579,6 +719,32 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
             if activity_id:
                 loaded[activity_id].append((method, data, source, resource))
             else:
+                records = _calibration_records(method, data, source, kwargs, boundaries["end"])
+                if method == "get_devices" and isinstance(data, list):
+                    for device in data:
+                        if isinstance(device, dict) and _id(device.get("deviceId")):
+                            device_catalog[_id(device["deviceId"])] = {
+                                "values": _select(device, DEVICE_METADATA), "source_id": source["source_id"],
+                            }
+                if method == "get_primary_training_device" and isinstance(data, dict):
+                    primary = data.get("PrimaryTrainingDevice") or data.get("primaryTrainingDevice")
+                    context = device_catalog.get(_id(primary.get("deviceId"))) if isinstance(primary, dict) else None
+                    if context and any(value is not None for value in context["values"].values()):
+                        records.append({"kind": "primary_training_device", "classification": "device_metadata",
+                            "source_id": source["source_id"], "supporting_source_id": context["source_id"],
+                            "date": None, "retrieved_at": source["retrieved_at"],
+                            "temporal_scope": "latest_at_retrieval", "historical_cutoff": boundaries["end"],
+                            "values": context["values"], "units": {},
+                            "interpretation": "Explicit primary-training-device lookup matched privately to the registered model. Identifiers are omitted. Current assignment does not prove the HR sensor used on historical activities."})
+                if method == "get_device_settings" and args:
+                    context = device_catalog.get(_id(args[0]))
+                    if context:
+                        for record in records:
+                            record["device_context"] = context
+                if records:
+                    calibration.extend(records)
+                    resource["normalization"] = "curated_calibration"
+                    resource["record_count"] = len(records)
                 kind, records = _daily_records(method, data)
                 if records:
                     for record in records:
@@ -636,7 +802,11 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
         if conflicts:
             activity["summary_conflicts"] = conflicts
         for method, data, source, resource in related:
-            if method == "get_activity_details":
+            if method == "get_activity" and isinstance(data, dict):
+                sensor_metadata = _activity_sensor_metadata(data, source["source_id"])
+                if sensor_metadata:
+                    activity["sensor_metadata"] = sensor_metadata
+            elif method == "get_activity_details":
                 activity["stream"] = {"source_id": source["source_id"], **summarize_stream(data)}
                 resource["normalization"] = "stream_profile"
             elif method in {"get_activity_splits", "get_activity_typed_splits"}:
@@ -679,6 +849,7 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
         "detail_selection_truncated": manifest.get("detail_selection_truncated") if isinstance(manifest.get("detail_selection_truncated"), bool) else None,
         "collection_counts": _select(manifest.get("counts"), _numeric_schema("activities", "selected_runs", "eligible_runs", "activity_pages", "unclassified_local_dates", "calls", "network_calls", "cached_calls", "successful_calls", "empty_calls", "failed_calls", "unavailable_calls")),
         "source_sampling": _select(manifest.get("sampling"), {"maxChartSize": "num", "maxPolylineSize": "num", "potentially_sampled": "bool", "original_fit_downloaded": "bool"}),
+        "calibration_collection": _select(manifest.get("calibration_policy"), {"max_device_settings": "num", "device_settings_truncated": "bool", "eligible_device_settings": "num", "explicit_primary_device_prioritized": "bool"}),
         "collection_completeness": [_select(item, {"reason": "token", "count": "num", "offset": "num", "selected": "num", "eligible": "num"}) for item in (manifest.get("completeness") or []) if isinstance(item, dict)],
         "call_status_counts": dict(Counter(source["status"] for source in sources)),
         "normalization_error_count": sum("normalization_error" in source for source in sources),
@@ -693,6 +864,7 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
         "daily_dates_by_kind": {kind: sorted({row["date"] for row in daily if row["kind"] == kind and row["date"]}) for kind in sorted({row["kind"] for row in daily})},
         "daily_records_without_date": sum(row["date"] is None for row in daily),
         "daily_values_normalized_to_null": len(quality_notes),
+        "calibration_records_by_kind": dict(Counter(row["kind"] for row in calibration)),
         "usable_metric_date_counts": _metric_date_counts(daily),
         "metric_count_definition": "Distinct dated finite numeric observations; negative sentinels excluded except signed temperature/body-battery-change values. This establishes field availability, not physiological validity.",
         "no_record_is_not_zero_or_rest": True,
@@ -709,12 +881,17 @@ def build_evidence(snapshot_dir: Path, output_dir: Path) -> dict:
         "Running-dynamics fields ending in _source retain vendor values; verify their endpoint units before comparisons.",
         "Daily nutrition/hydration are recorded entries, not verified consumption or absorption; absent entries do not mean zero intake.",
         "Unknown schemas expose availability only. Unsupported weather units and downsampled stream terrain must be checked before quantitative interpretation.",
+        "Garmin threshold outputs are vendor-reported estimates/settings, configured HR zones are configuration, and device metadata is not proof of historical sensor use. None establishes measured maximum HR; latest values reflect retrieval time, potentially after the historical cutoff.",
     ]
+    weeks = _weeks(runs, boundaries)
+    capacity_metrics = build_capacity_metrics(runs, weeks, calibration or None)
     bundle = {"schema_version": SCHEMA_VERSION,
               "generated_at": datetime.now(timezone.utc).isoformat(),
               "coverage": coverage, "sources": sources,
-              "activities": [{key: value for key, value in activity.items() if key not in {"stream", "laps", "laps_omitted", "laps_source_id", "weather", "hr_zones", "gear"}} for activity in activities],
-              "runs": runs, "weeks": _weeks(runs, boundaries), "daily": daily,
+              "activities": [{key: value for key, value in activity.items() if key not in {"stream", "laps", "laps_omitted", "laps_source_id", "weather", "hr_zones", "gear", "sensor_metadata"}} for activity in activities],
+              "runs": runs, "weeks": weeks, "daily": daily,
+              "calibration": calibration,
+              "capacity_metrics": capacity_metrics,
               "daily_units": {kind: _daily_units(kind) for kind in sorted({row["kind"] for row in daily}) if _daily_units(kind)},
               "resources": resources, "data_quality_notes": quality_notes, "limitations": limitations}
     _safe_write(output_dir / "evidence.json", json.dumps(bundle, indent=2, allow_nan=False) + "\n")
@@ -735,6 +912,13 @@ def _markdown(bundle: dict) -> str:
         lines += ["", "## Data quality corrections", ""]
         for note in bundle["data_quality_notes"]:
             lines.append(f"- {note['date'] or 'Date unknown'}: {note['kind']}.{note['field']} from {note['source_id']} was {note['original_value']} and is represented as null. {note['reason']}")
+    lines += ["", "## Calibration availability", "",
+              f"Curated records by kind: {json.dumps(coverage['calibration_records_by_kind'], sort_keys=True)}.",
+              "Garmin threshold estimates, configured HR values and device metadata are separate evidence categories. Latest configuration is retrieval-time state, not a historical snapshot. No measured maximum HR is inferred."]
+    capacity = bundle["capacity_metrics"]
+    lines += ["", "## Capacity evidence index", "",
+              f"HR-quality records: {len(capacity['heart_rate_quality']['runs'])}; selected sustained windows: {len(capacity['sustained_windows'])}; long-window review candidates: {len(capacity['long_steady_candidates'])}.",
+              "The capacity_metrics section contains exact-distance weekly summaries, HR coverage checks and bounded continuous-window observations. Screening flags require terrain, effort, sensor and recovery review; these are not physiological thresholds or a finish-time forecast."]
     lines += ["", "## Evidence usage", "", "Use evidence.json for dated activities, laps, bounded terrain/pace/HR profiles, curated daily records and source ids. Unknown resources are available for local review but not copied into model context.", "", "## Limitations", ""]
     lines += [f"- {limitation}" for limitation in bundle["limitations"]]
     return "\n".join(lines) + "\n"

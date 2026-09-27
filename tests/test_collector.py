@@ -24,7 +24,7 @@ class FakeGarmin:
         return result
 
     def __getattr__(self, name):
-        if name not in collector.RANGE_METHODS + collector.DAILY_METHODS + collector.DETAIL_METHODS:
+        if name not in collector.RANGE_METHODS + collector.DAILY_METHODS + collector.DETAIL_METHODS + collector.CALIBRATION_METHODS:
             raise AttributeError(name)
 
         def call(*args, **kwargs):
@@ -208,3 +208,68 @@ def test_invalid_inputs_fail_before_files_or_network(tmp_path, options):
         collect(fake, folder, **options)
     assert fake.calls == []
     assert not folder.exists()
+
+
+def test_calibration_calls_bound_history_and_device_settings_and_resume(tmp_path):
+    devices = [{"deviceId": value} for value in (101, 101, "202", True, None, "../private", 303, 404)]
+    fake = FakeGarmin(responses={"get_devices": devices})
+    first = collect(fake, tmp_path, start=date(2026, 3, 1), end=date(2026, 6, 2), max_details=0)
+
+    threshold = [(args, kwargs) for method, args, kwargs in fake.calls if method == "get_lactate_threshold"]
+    assert threshold == [
+        ((), {"latest": True}),
+        ((), {"latest": False, "start_date": "2026-03-01", "end_date": "2026-06-02", "aggregation": "daily"}),
+    ]
+    device_reads = [args for method, args, _ in fake.calls if method == "get_device_settings"]
+    assert device_reads == [("101",), ("202",), ("303",)]
+    assert first["calibration_policy"]["device_settings_truncated"] is True
+    assert first["calibration_policy"]["eligible_device_settings"] == 4
+    assert all(method.startswith("get_") for method, _, _ in fake.calls)
+
+    resumed_client = FakeGarmin()
+    resumed = collect(resumed_client, tmp_path, start=date(2026, 3, 1), end=date(2026, 6, 2), max_details=0)
+    assert resumed_client.calls == []
+    assert resumed["counts"]["cached_calls"] == len(first["calls"])
+
+
+def test_adding_calibration_to_old_snapshot_fetches_only_new_resources(tmp_path):
+    first = collect(FakeGarmin(), tmp_path, max_details=0)
+    old_calls = [row for row in first["calls"] if row["method"] not in collector.CALIBRATION_METHODS]
+    first["calls"] = old_calls
+    first["resume_cache"] = old_calls
+    (tmp_path / "manifest.json").write_text(json.dumps(first))
+    updated_client = FakeGarmin()
+
+    updated = collect(updated_client, tmp_path, max_details=0)
+
+    assert updated["counts"]["cached_calls"] == len(old_calls)
+    assert [method for method, _, _ in updated_client.calls] == [
+        "get_lactate_threshold", "get_lactate_threshold", *collector.CALIBRATION_CURRENT_METHODS,
+    ]
+
+
+def test_calibration_missing_or_failed_methods_are_recorded_without_aborting_other_reads(tmp_path):
+    fake = FakeGarmin(responses={
+        "get_lactate_threshold": NotImplementedError(),
+        "get_heart_rate_zones": RuntimeError("HTTP 503 private response"),
+        "get_devices": [{"deviceId": 123}],
+    })
+    manifest = collect(fake, tmp_path, max_details=0)
+    assert manifest["status"] == "partial"
+    lt_rows = [row for row in manifest["calls"] if row["method"] == "get_lactate_threshold"]
+    assert [row["status"] for row in lt_rows] == ["unavailable", "unavailable"]
+    assert [row["attempted"] for row in lt_rows] == [True, False]
+    assert any(method == "get_device_settings" for method, _, _ in fake.calls)
+    assert "private response" not in (tmp_path / "manifest.json").read_text()
+
+
+def test_explicit_primary_training_device_is_prioritized_over_old_registered_devices(tmp_path):
+    fake = FakeGarmin(responses={
+        "get_devices": [{"deviceId": value} for value in (101, 202, 303, 404)],
+        "get_primary_training_device": {"PrimaryTrainingDevice": {"deviceId": 404}},
+    })
+    manifest = collect(fake, tmp_path, max_details=0)
+    settings = [args for method, args, _ in fake.calls if method == "get_device_settings"]
+    assert settings == [("404",), ("101",), ("202",)]
+    assert manifest["calibration_policy"]["explicit_primary_device_prioritized"] is True
+    assert len(settings) == collector.MAX_DEVICE_SETTINGS
