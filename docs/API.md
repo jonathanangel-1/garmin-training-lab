@@ -122,6 +122,8 @@ A newly queued job includes `id`, `kind`, `status`, `created_at`, and either `sn
 
 States are `queued`, `running`, `completed`, `failed`, and `interrupted`. On service startup, previous queued/running jobs are marked interrupted. The server allows one job at a time; starting another while busy returns 409. It does not resume background work automatically.
 
+The job lock covers this API process only. Do not start CLI collection or analysis against the same state directory while an API job is running, and do not run multiple server processes against one state directory.
+
 After an analysis job completes, request `/v1/analyses/{analysis_id}`. The final object includes:
 
 - `summary`, `confidence`, and `goal_assessment` (`supported`, `conditional`, `not_supported`, or `insufficient_data`).
