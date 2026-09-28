@@ -114,11 +114,15 @@ Elevation totals and kilometer splits do not reconstruct the slopes inside each 
 
 The [2021 athlete sleep consensus](https://pubmed.ncbi.nlm.nih.gov/33144349/) supports individualized assessment and identifies limits in evidence about partial sleep restriction. The analysts compare personal baselines and dated patterns. They cannot diagnose an illness, injury, or cause of poor performance from these metrics alone. Athlete notes about symptoms and tolerance remain necessary when they materially affect a prescription.
 
+Planning and audit rules distinguish an immediate session adjustment from a lasting race-goal conclusion. An isolated HR reading or transient post-session fatigue can justify checking the signal, slowing or repeating work without establishing race-goal failure. A lasting conclusion based on HR or fatigue requires context plus repeated or persistent supporting evidence; significant symptoms may independently require immediate action. Each conditional rule must specify the next action and when to reassess.
+
 ### Tapering and remaining workload
 
 The [2023 endurance taper meta-analysis](https://pubmed.ncbi.nlm.nih.gov/37163550/) supports tapering while showing that results depend on several protocol components. An [observational marathon study](https://pubmed.ncbi.nlm.nih.gov/34651125/) associated disciplined longer tapers with better performance in recreational runners; it does not establish one optimal duration for an individual.
 
 The workflow therefore asks the lead to choose a taper from completed training, race timing, and recovery context instead of imposing a fixed two-week template. A user-specified maximum of hard sessions is a ceiling, not a quota. Long runs and races count toward the plan's stressor limit.
+
+Scheduled taper totals are conditional ceilings tied to the build actually completed and tolerated. The reason for omissions matters: training missed because of logistics or weather does not automatically reduce future training, while reductions for fatigue or pain require an explicit recovery and tolerance branch before returning to the original prescription. The plan must give executable actions for the relevant circumstances. It must neither rebuild omitted minutes blindly nor impose a rule that every successive week must contain less running.
 
 ## 6. What is checked automatically
 
